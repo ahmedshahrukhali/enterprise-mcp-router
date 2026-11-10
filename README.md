@@ -57,7 +57,7 @@ git clone https://github.com/ahmedshahrukhali/enterprise-mcp-router.git
 cd enterprise-mcp-router
 pip install -r requirements.txt
 
-# 1. Launch the interactive web control plane at http://localhost:8000
+# 1. Launch the interactive web control plane at http://localhost:8000 (OpenAPI docs at /docs)
 uvicorn src.main:app --reload --port 8000
 
 # 2. Run the terminal benchmark & simulation runner
@@ -93,58 +93,6 @@ By filtering the catalog down to the **top-$k$ tools** matching the user's inten
 | **Top-10 Tools** | 15,878 tokens | **1,520 tokens** | **90.4%** | 2.1 ms | Broad multi-hop investigation across 3+ systems |
 
 > **Design Note on Recall vs. Context Size:** Because aggressive filtering ($k=3$) can occasionally miss a secondary tool needed for a multi-system query, `top_k` is configurable per request (`1` to `25`) and supports optional `domain_filter` scoping or full catalog listing via the MCP `tools/list` endpoint.
-
----
-
-## Project Structure
-
-```
-enterprise-mcp-router/
-├── .github/workflows/ci.yml        # GitHub Actions CI (Python 3.10, 3.11, 3.12)
-├── src/
-│   ├── main.py                     # FastAPI server, REST API & JSON-RPC 2.0 endpoints
-│   ├── models.py                   # Pydantic v2 request/response schemas
-│   ├── router.py                   # EnterpriseMCPRouter, FastMCPServer & HITL queue
-│   ├── dashboard_html.py           # Interactive Web Control Plane UI (Tailwind + Chart.js)
-│   ├── registry/catalog.py         # 105 enterprise tools across 7 domains
-│   ├── connectors/data_connectors.py # Snowflake, Informatica IICS, PostgreSQL, REST
-│   ├── adapters/agent_adapters.py  # Amazon Bedrock Converse API & LangGraph/smolagents/CrewAI
-│   └── telemetry/observability.py  # OpenTelemetry spans, token budgets & L2 runbooks
-├── tests/
-│   ├── test_router.py              # Routing, RBAC/HITL, connectors & adapter unit tests
-│   └── test_api.py                 # FastAPI REST & JSON-RPC 2.0 integration tests
-├── run_demo.py                     # CLI benchmark & simulation runner
-├── Dockerfile                      # Container image definition
-├── requirements.txt                # Runtime & test dependencies
-└── pyproject.toml                  # Package configuration
-```
-
----
-
-## REST & JSON-RPC 2.0 Endpoints
-
-Interactive OpenAPI docs are served at `http://localhost:8000/docs`:
-
-| Method | Endpoint | Description |
-|---|---|---|
-| `GET` | `/` | Interactive 5-tab Enterprise MCP Control Plane dashboard |
-| `GET` | `/health` | Service health, 105-tool count, pending HITL tickets, and RAG lock status |
-| `POST` | `/mcp/jsonrpc` | MCP JSON-RPC 2.0 endpoint (`initialize`, `tools/list`, `tools/call`, `resources/list`) |
-| `POST` | `/api/v1/router/search` | Routes natural language intent to top-$k$ MCP tools and reports token savings |
-| `POST` | `/api/v1/governance/authorize` | Evaluates RBAC role permissions and HITL approval status |
-| `GET` | `/api/v1/governance/hitl` | Lists pending and resolved Human-in-the-Loop (HITL) approval tickets |
-| `POST` | `/api/v1/governance/hitl/create` | Queues a new HITL approval ticket for a mutating tool call |
-| `POST` | `/api/v1/governance/hitl/resolve` | Approves or rejects a pending HITL ticket |
-| `POST` | `/api/v1/connectors/snowflake/validate-sql` | Checks Snowflake SQL against RBAC, schema allow-list, and DDL/DML blocklist |
-| `POST` | `/api/v1/connectors/snowflake/cortex-search` | Runs governed Snowflake Cortex Search retrieval over compliance docs |
-| `POST` | `/api/v1/connectors/informatica/validate` | Checks Informatica Cloud (IICS) ELT status, row counts, and freshness lag |
-| `POST` | `/api/v1/connectors/postgres/query` | Runs read-only SQL queries against the PostgreSQL ledger |
-| `POST` | `/api/v1/connectors/postgres/snapshot/create` | Saves a point-in-time state snapshot of the PostgreSQL ledger |
-| `POST` | `/api/v1/connectors/postgres/snapshot/restore` | Restores PostgreSQL tables to a saved snapshot |
-| `POST` | `/api/v1/adapters/bedrock/invoke` | Simulates Amazon Bedrock structured output verification with automatic retry |
-| `GET` | `/api/v1/adapters/bridges/{framework}` | Exports routed tools into `langgraph`, `smolagents`, or `crewai` formats |
-| `GET` | `/api/v1/telemetry/summary` | Returns OpenTelemetry latency percentiles, trace spans, and token alerts |
-| `POST` | `/api/v1/telemetry/runbook` | Generates step-by-step L2 troubleshooting runbooks |
 
 ---
 
