@@ -21,6 +21,8 @@ from src.connectors.data_connectors import (
     SnowflakeCortexConnector,
 )
 from src.registry.catalog import compute_query_embedding, get_enterprise_tool_catalog
+from src.security import HITLGovernanceRules
+from src.storage import BaseStateStore, get_default_storage
 from src.telemetry.observability import ProductionTelemetryMonitor, TraceSpan
 
 
@@ -48,17 +50,22 @@ class EnterpriseMCPRouter:
     and enforces deterministic OAuth2 RBAC + Human-in-the-Loop (HITL) governance.
     """
 
-    def __init__(self, tools: Optional[List[MCPToolSpec]] = None):
+    def __init__(
+        self,
+        tools: Optional[List[MCPToolSpec]] = None,
+        storage: Optional[BaseStateStore] = None,
+    ):
         if tools is None:
             tools = self._load_default_catalog_specs()
         self.tools: Dict[str, MCPToolSpec] = {t.name: t for t in tools}
+        self.storage: BaseStateStore = storage or get_default_storage()
         self.hitl_tickets: Dict[str, Dict[str, Any]] = {}
         self.audit_trail: List[Dict[str, Any]] = []
 
     @classmethod
-    def from_enterprise_catalog(cls) -> "EnterpriseMCPRouter":
+    def from_enterprise_catalog(cls, storage: Optional[BaseStateStore] = None) -> "EnterpriseMCPRouter":
         """Instantiates router pre-loaded with the 105-tool Enterprise MCP Catalog."""
-        return cls(tools=cls._load_default_catalog_specs())
+        return cls(tools=cls._load_default_catalog_specs(), storage=storage)
 
     @staticmethod
     def _load_default_catalog_specs() -> List[MCPToolSpec]:
@@ -157,10 +164,16 @@ class EnterpriseMCPRouter:
         user_roles: List[str],
         arguments: Optional[Dict[str, Any]] = None,
         justification: str = "Agent requested execution of mutating enterprise tool.",
+        ttl_seconds: int = 1800,
     ) -> Dict[str, Any]:
-        """Creates a stateful Human-in-the-Loop (HITL) approval interrupt ticket."""
+        """Creates a stateful Human-in-the-Loop (HITL) approval interrupt ticket with TTL expiration."""
         spec = self.tools.get(tool_name)
         ticket_id = f"HITL-{uuid.uuid4().hex[:8].upper()}"
+        now = time.time()
+        expires_at_epoch = now + ttl_seconds
+        expires_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(expires_at_epoch))
+        created_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now))
+
         ticket = {
             "ticket_id": ticket_id,
             "tool_name": tool_name,
@@ -174,17 +187,21 @@ class EnterpriseMCPRouter:
             "status": "PENDING_APPROVAL",
             "reviewer": None,
             "notes": None,
-            "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "created_at": created_at,
+            "expires_at": expires_at,
+            "expires_at_epoch": expires_at_epoch,
         }
         self.hitl_tickets[ticket_id] = ticket
-        self.audit_trail.append(
-            {
-                "event": "HITL_INTERRUPT_CREATED",
-                "ticket_id": ticket_id,
-                "tool_name": tool_name,
-                "requested_by": requested_by,
-            }
-        )
+        self.storage.save_ticket(ticket)
+        audit_event = {
+            "event": "HITL_INTERRUPT_CREATED",
+            "ticket_id": ticket_id,
+            "tool_name": tool_name,
+            "requested_by": requested_by,
+            "expires_at": expires_at,
+        }
+        self.audit_trail.append(audit_event)
+        self.storage.append_audit_event(audit_event)
         return ticket
 
     def resolve_hitl_interrupt(
@@ -193,9 +210,14 @@ class EnterpriseMCPRouter:
         reviewer: str,
         decision: str,
         notes: str = "",
+        reviewer_roles: Optional[List[str]] = None,
     ) -> Dict[str, Any]:
-        """Approves or rejects a pending HITL interrupt ticket."""
+        """Approves or rejects a pending HITL interrupt ticket with separation-of-duties enforcement."""
         ticket = self.hitl_tickets.get(ticket_id)
+        if not ticket:
+            ticket = self.storage.get_ticket(ticket_id)
+            if ticket:
+                self.hitl_tickets[ticket_id] = ticket
         if not ticket:
             return {"status": "error", "reason": "hitl_ticket_not_found", "ticket_id": ticket_id}
 
@@ -203,18 +225,32 @@ class EnterpriseMCPRouter:
         if normalized_decision not in ("APPROVED", "REJECTED"):
             return {"status": "error", "reason": "invalid_hitl_decision", "ticket_id": ticket_id}
 
+        # Enforce HITL governance rules (no self-approval, no expired tickets, valid roles)
+        ok, rule_err = HITLGovernanceRules.validate_resolution(
+            ticket=ticket,
+            reviewer=reviewer,
+            reviewer_roles=reviewer_roles,
+        )
+        if not ok:
+            if rule_err == "hitl_ticket_expired":
+                ticket["status"] = "EXPIRED"
+                self.storage.save_ticket(ticket)
+            return {"status": "error", "reason": rule_err, "ticket_id": ticket_id}
+
         ticket["status"] = normalized_decision
         ticket["reviewer"] = reviewer
         ticket["notes"] = notes
         ticket["resolved_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-        self.audit_trail.append(
-            {
-                "event": f"HITL_{normalized_decision}",
-                "ticket_id": ticket_id,
-                "tool_name": ticket["tool_name"],
-                "reviewer": reviewer,
-            }
-        )
+        self.storage.save_ticket(ticket)
+
+        audit_event = {
+            "event": f"HITL_{normalized_decision}",
+            "ticket_id": ticket_id,
+            "tool_name": ticket["tool_name"],
+            "reviewer": reviewer,
+        }
+        self.audit_trail.append(audit_event)
+        self.storage.append_audit_event(audit_event)
         return ticket
 
     def authorize_execution(
@@ -223,6 +259,7 @@ class EnterpriseMCPRouter:
         user_roles: List[str],
         hitl_approved: bool = False,
         hitl_ticket_id: Optional[str] = None,
+        require_ticket: bool = False,
     ) -> Dict[str, Any]:
         """Enforces deterministic RBAC and HITL confirmation before executing mutating MCP tools."""
         spec = self.tools.get(tool_name)
@@ -230,14 +267,14 @@ class EnterpriseMCPRouter:
             return {"allowed": False, "reason": "tool_not_found", "tool_name": tool_name}
 
         if spec.required_role not in user_roles and "super_admin" not in user_roles:
-            self.audit_trail.append(
-                {
-                    "event": "RBAC_DENIED",
-                    "tool_name": tool_name,
-                    "required_role": spec.required_role,
-                    "user_roles": user_roles,
-                }
-            )
+            audit_event = {
+                "event": "RBAC_DENIED",
+                "tool_name": tool_name,
+                "required_role": spec.required_role,
+                "user_roles": user_roles,
+            }
+            self.audit_trail.append(audit_event)
+            self.storage.append_audit_event(audit_event)
             return {
                 "allowed": False,
                 "reason": "rbac_denied",
@@ -247,28 +284,62 @@ class EnterpriseMCPRouter:
             }
 
         # Check HITL ticket approval if provided
-        if hitl_ticket_id and hitl_ticket_id in self.hitl_tickets:
-            ticket = self.hitl_tickets[hitl_ticket_id]
-            if ticket["tool_name"] == tool_name and ticket["status"] == "APPROVED":
-                hitl_approved = True
+        if hitl_ticket_id:
+            ticket = self.hitl_tickets.get(hitl_ticket_id)
+            if not ticket:
+                ticket = self.storage.get_ticket(hitl_ticket_id)
+                if ticket:
+                    self.hitl_tickets[hitl_ticket_id] = ticket
 
-        if spec.is_mutating and not hitl_approved:
-            return {
-                "allowed": False,
-                "reason": "hitl_approval_required",
-                "tool_name": tool_name,
-                "required_role": spec.required_role,
-                "is_mutating": True,
-            }
+            if not ticket:
+                return {
+                    "allowed": False,
+                    "reason": "hitl_ticket_not_found",
+                    "tool_name": tool_name,
+                    "ticket_id": hitl_ticket_id,
+                }
 
-        self.audit_trail.append(
-            {
-                "event": "EXECUTION_AUTHORIZED",
-                "tool_name": tool_name,
-                "user_roles": user_roles,
-                "hitl_approved": hitl_approved,
-            }
-        )
+            ok, rule_err = HITLGovernanceRules.validate_consumption(ticket=ticket, tool_name=tool_name)
+            if not ok:
+                return {
+                    "allowed": False,
+                    "reason": rule_err,
+                    "tool_name": tool_name,
+                    "ticket_id": hitl_ticket_id,
+                }
+
+            # Mark ticket as CONSUMED (single-use replay prevention)
+            ticket["status"] = "CONSUMED"
+            ticket["consumed_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+            self.storage.save_ticket(ticket)
+            hitl_approved = True
+
+        if spec.is_mutating:
+            if require_ticket and not hitl_ticket_id:
+                return {
+                    "allowed": False,
+                    "reason": "hitl_ticket_required",
+                    "tool_name": tool_name,
+                    "required_role": spec.required_role,
+                    "is_mutating": True,
+                }
+            if not hitl_approved:
+                return {
+                    "allowed": False,
+                    "reason": "hitl_approval_required",
+                    "tool_name": tool_name,
+                    "required_role": spec.required_role,
+                    "is_mutating": True,
+                }
+
+        audit_event = {
+            "event": "EXECUTION_AUTHORIZED",
+            "tool_name": tool_name,
+            "user_roles": user_roles,
+            "hitl_approved": hitl_approved,
+        }
+        self.audit_trail.append(audit_event)
+        self.storage.append_audit_event(audit_event)
         return {
             "allowed": True,
             "reason": "authorized",

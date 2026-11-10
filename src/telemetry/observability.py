@@ -92,8 +92,15 @@ class ProductionTelemetryMonitor:
         },
     }
 
-    def __init__(self, token_budget_per_use_case: int = 10_000):
+    def __init__(
+        self,
+        token_budget_per_use_case: int = 10_000,
+        max_spans: int = 2000,
+        max_alerts: int = 500,
+    ):
         self.token_budget_per_use_case = token_budget_per_use_case
+        self.max_spans = max_spans
+        self.max_alerts = max_alerts
         self.spans: List[TraceSpan] = []
         self.token_usage_by_use_case: Dict[str, int] = {}
         self.alerts: List[Dict[str, Any]] = []
@@ -121,6 +128,9 @@ class ProductionTelemetryMonitor:
             error_message=error_message,
         )
         self.spans.append(span)
+        if len(self.spans) > self.max_spans:
+            self.spans = self.spans[-self.max_spans:]
+
         self.token_usage_by_use_case[use_case] = (
             self.token_usage_by_use_case.get(use_case, 0) + total_tokens
         )
@@ -145,6 +155,9 @@ class ProductionTelemetryMonitor:
                     "budget": self.token_budget_per_use_case,
                 }
             )
+
+        if len(self.alerts) > self.max_alerts:
+            self.alerts = self.alerts[-self.max_alerts:]
 
         return span
 

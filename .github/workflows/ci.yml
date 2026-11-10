@@ -27,3 +27,5 @@ jobs:
         run: pytest -v
       - name: Run CLI Benchmark Simulation
         run: python run_demo.py
+      - name: Build Docker image
+        run: docker build -t enterprise-mcp-router:ci .

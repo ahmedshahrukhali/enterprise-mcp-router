@@ -78,7 +78,10 @@ def compute_query_embedding(text: str) -> List[float]:
     vec: List[float] = []
     for dom in DOMAIN_ORDER:
         kw_list = DOMAIN_KEYWORDS[dom]
-        hits = sum(1.5 if kw in token_set else (0.6 if any(kw in tok for tok in token_set) else 0.0) for kw in kw_list)
+        hits = sum(
+            1.5 if kw in token_set else (0.6 if len(kw) > 3 and any(kw in tok for tok in token_set) else 0.0)
+            for kw in kw_list
+        )
         vec.append(hits + 0.05)
 
     # Dimensions 7..15 capture operational semantics (read vs mutate, search, sql, alert, etc.)

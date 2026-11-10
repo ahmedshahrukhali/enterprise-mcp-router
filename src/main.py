@@ -11,10 +11,11 @@ Exposes:
 """
 
 from typing import Any, Dict
-from fastapi import FastAPI
-from fastapi.responses import HTMLResponse
+from fastapi import Depends, FastAPI, HTTPException
+from fastapi.responses import HTMLResponse, JSONResponse
 
 from src.dashboard_html import DASHBOARD_HTML
+from src.security import AuthenticatedPrincipal, get_current_principal
 from src.models import (
     AuthorizationRequest,
     BedrockStructuredInvokeRequest,
@@ -143,13 +144,18 @@ def semantic_route_tools(req: SemanticRouteRequest) -> Dict[str, Any]:
 
 
 @app.post("/api/v1/governance/authorize")
-def authorize_tool_call(req: AuthorizationRequest) -> Dict[str, Any]:
+def authorize_tool_call(
+    req: AuthorizationRequest,
+    principal: AuthenticatedPrincipal = Depends(get_current_principal),
+) -> Dict[str, Any]:
     """Evaluates deterministic RBAC and HITL approval gates for a tool invocation."""
+    user_roles = principal.roles if principal.is_authenticated else (req.user_roles or principal.roles)
     return mcp_router.authorize_execution(
         tool_name=req.tool_name,
-        user_roles=req.user_roles,
-        hitl_approved=req.hitl_approved,
+        user_roles=user_roles,
+        hitl_approved=False,  # External callers must supply an approved ticket_id for mutations
         hitl_ticket_id=req.hitl_ticket_id,
+        require_ticket=True,
     )
 
 
@@ -161,26 +167,48 @@ def list_hitl_tickets() -> Dict[str, Any]:
 
 
 @app.post("/api/v1/governance/hitl/create")
-def create_hitl_ticket(req: HITLCreateRequest) -> Dict[str, Any]:
+def create_hitl_ticket(
+    req: HITLCreateRequest,
+    principal: AuthenticatedPrincipal = Depends(get_current_principal),
+) -> Dict[str, Any]:
     """Creates a new Human-in-the-Loop (HITL) approval interrupt ticket."""
+    requested_by = principal.username if principal.is_authenticated else req.requested_by
+    user_roles = principal.roles if principal.is_authenticated else req.user_roles
     return mcp_router.create_hitl_interrupt(
         tool_name=req.tool_name,
-        requested_by=req.requested_by,
-        user_roles=req.user_roles,
+        requested_by=requested_by,
+        user_roles=user_roles,
         arguments=req.arguments,
         justification=req.justification,
     )
 
 
 @app.post("/api/v1/governance/hitl/resolve")
-def resolve_hitl_ticket(req: HITLResolutionRequest) -> Dict[str, Any]:
+def resolve_hitl_ticket(
+    req: HITLResolutionRequest,
+    principal: AuthenticatedPrincipal = Depends(get_current_principal),
+) -> Dict[str, Any]:
     """Approves or rejects a pending Human-in-the-Loop (HITL) interrupt ticket."""
-    return mcp_router.resolve_hitl_interrupt(
+    reviewer = principal.username if principal.is_authenticated else req.reviewer
+    reviewer_roles = principal.roles if principal.is_authenticated else ["platform_admin"]
+
+    result = mcp_router.resolve_hitl_interrupt(
         ticket_id=req.ticket_id,
-        reviewer=req.reviewer,
+        reviewer=reviewer,
         decision=req.decision,
         notes=req.notes,
+        reviewer_roles=reviewer_roles,
     )
+    if result.get("status") == "error":
+        reason = result.get("reason", "")
+        if "prohibited" in reason or "not_authorized" in reason:
+            return JSONResponse(status_code=403, content=result)
+        elif "not_found" in reason:
+            return JSONResponse(status_code=404, content=result)
+        elif "expired" in reason:
+            return JSONResponse(status_code=410, content=result)
+        return JSONResponse(status_code=400, content=result)
+    return result
 
 
 @app.post("/api/v1/connectors/snowflake/validate-sql")
@@ -222,9 +250,15 @@ def create_postgres_snapshot(req: PostgresSnapshotRequest) -> Dict[str, Any]:
 
 
 @app.post("/api/v1/connectors/postgres/snapshot/restore")
-def restore_postgres_snapshot(req: PostgresSnapshotRequest) -> Dict[str, Any]:
+def restore_postgres_snapshot(
+    req: PostgresSnapshotRequest,
+    principal: AuthenticatedPrincipal = Depends(get_current_principal),
+) -> Dict[str, Any]:
     """Restores the PostgreSQL ledger to a verified point-in-time snapshot."""
-    return postgres_connector.restore_snapshot(req.snapshot_name)
+    if not (principal.has_role("platform_admin") or "platform_admin" in principal.roles):
+        raise HTTPException(status_code=403, detail="platform_admin_role_required_for_snapshot_restore")
+    actor = principal.username if principal.is_authenticated else "platform_admin"
+    return postgres_connector.restore_snapshot(req.snapshot_name, actor=actor)
 
 
 @app.post("/api/v1/adapters/bedrock/invoke")

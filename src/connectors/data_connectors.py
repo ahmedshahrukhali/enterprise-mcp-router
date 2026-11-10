@@ -9,7 +9,9 @@ Governed Enterprise Data & Cloud Connectors:
 import copy
 import re
 import time
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Set
+
+from src.connectors.sql_guard import SafeSQLValidator
 
 
 class SnowflakeCortexConnector:
@@ -75,38 +77,20 @@ class SnowflakeCortexConnector:
         return len(self._knowledge_chunks)
 
     def validate_readonly_sql(self, sql: str, role: str, schema: str) -> Dict[str, Any]:
-        """Validates that an agent-generated Snowflake query obeys read-only RBAC policies."""
-        if role not in self.allowed_roles:
-            return {"valid": False, "reason": "snowflake_rbac_role_denied", "role": role, "schema": schema}
-        if schema not in self.allowed_schemas:
-            return {"valid": False, "reason": "snowflake_schema_not_allowlisted", "role": role, "schema": schema}
+        """Validates that an agent-generated Snowflake query obeys read-only RBAC policies using AST inspection."""
+        res = SafeSQLValidator.validate_readonly_sql(
+            sql=sql,
+            dialect="snowflake",
+            allowed_roles=self.allowed_roles,
+            allowed_schemas=self.allowed_schemas,
+            role=role,
+            schema=schema,
+        )
+        if not res["valid"]:
+            return res
 
-        # Strip SQL comments before inspection to prevent comment-obfuscated attacks
-        stripped = self.SQL_COMMENT_PATTERN.sub(" ", sql).strip()
-        if not stripped:
-            return {"valid": False, "reason": "empty_sql_query", "role": role, "schema": schema}
-
-        # Check for forbidden DDL/DML keywords anywhere in the statement first
-        if self.FORBIDDEN_SQL_PATTERN.search(stripped):
-            return {"valid": False, "reason": "mutating_sql_keyword_blocked", "role": role, "schema": schema}
-
-        # Check for stacked multi-statement queries (e.g. SELECT 1; SELECT 2)
-        statements = [s.strip() for s in stripped.split(";") if s.strip()]
-        if len(statements) > 1:
-            return {"valid": False, "reason": "multi_statement_sql_blocked", "role": role, "schema": schema}
-
-        upper_stmt = statements[0].upper()
-        if not (upper_stmt.startswith("SELECT") or upper_stmt.startswith("WITH")):
-            return {"valid": False, "reason": "only_select_queries_permitted", "role": role, "schema": schema}
-
-        return {
-            "valid": True,
-            "reason": "validated_readonly_query",
-            "role": role,
-            "schema": schema,
-            "normalized_sql": statements[0],
-            "sample_rows": self._structured_funds[:3],
-        }
+        res["sample_rows"] = self._structured_funds[:3]
+        return res
 
     def retrieve_cortex_rag(
         self, query: str, role: str, top_k: int = 3
@@ -233,13 +217,24 @@ class PostgresEnterpriseConnector:
             }
         }
 
+    ALLOWED_ROLES: Set[str] = {"analyst", "compliance_officer", "data_engineer", "platform_admin", "super_admin"}
+
     def query_ledger(self, sql: str, role: str = "analyst") -> Dict[str, Any]:
-        cleaned = sql.strip()
-        if not cleaned.upper().startswith("SELECT"):
-            return {"status": "error", "reason": "postgres_readonly_endpoint_requires_select", "rows": []}
+        if role not in self.ALLOWED_ROLES:
+            return {"status": "error", "reason": "postgres_rbac_role_denied", "rows": []}
+
+        validation = SafeSQLValidator.validate_readonly_sql(sql=sql, dialect="postgres")
+        if not validation["valid"]:
+            return {
+                "status": "error",
+                "reason": "postgres_readonly_endpoint_requires_select"
+                if "blocked" in validation["reason"]
+                else validation["reason"],
+                "rows": [],
+            }
 
         rows = copy.deepcopy(self._accounts)
-        upper = cleaned.upper()
+        upper = sql.upper()
         if "RISK_TIER = 'LOW'" in upper or 'RISK_TIER="LOW"' in upper:
             rows = [r for r in rows if r["risk_tier"] == "LOW"]
         elif "RISK_TIER = 'HIGH'" in upper:
@@ -295,7 +290,7 @@ class PostgresEnterpriseConnector:
             "available_snapshots": list(self._snapshots.keys()),
         }
 
-    def restore_snapshot(self, snapshot_name: str) -> Dict[str, Any]:
+    def restore_snapshot(self, snapshot_name: str, actor: str = "platform_admin") -> Dict[str, Any]:
         snap = self._snapshots.get(snapshot_name)
         if not snap:
             return {"status": "error", "reason": "snapshot_not_found", "available_snapshots": list(self._snapshots.keys())}
@@ -305,8 +300,8 @@ class PostgresEnterpriseConnector:
             {
                 "event_id": len(self._audit_log) + 1,
                 "action": "SNAPSHOT_RESTORE",
-                "actor": "platform_admin",
-                "detail": f"Restored PostgreSQL state to snapshot '{snapshot_name}'",
+                "actor": actor,
+                "detail": f"Restored PostgreSQL state to snapshot '{snapshot_name}' by {actor}",
             }
         )
         return {
