@@ -1,188 +1,152 @@
-# Enterprise-MCP-Router: FastMCP Semantic Tool Gateway, Cloud Data Connectors & Agentic AI Governance
+# Enterprise-MCP-Router
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 [![FastMCP / JSON-RPC 2.0](https://img.shields.io/badge/Protocol-FastMCP%20%7C%20JSON--RPC%202.0-0ea5e9.svg)]()
-[![AWS Bedrock AgentCore](https://img.shields.io/badge/AWS-Bedrock%20%7C%20AgentCore-ff9900.svg)]()
-[![Snowflake Cortex](https://img.shields.io/badge/Snowflake-Cortex%20Search%20%7C%20RBAC-29b5e8.svg)]()
 [![FastAPI](https://img.shields.io/badge/FastAPI-2.1-009688.svg)](https://fastapi.tiangolo.com/)
 [![Tests Passing](https://img.shields.io/badge/tests-14%20passed-brightgreen.svg)]()
 
-A production-grade **Model Context Protocol (`FastMCP` / JSON-RPC 2.0)** gateway, **105-tool semantic router**, and **cloud data connector harness** engineered to move enterprise **Agentic AI** workloads (**LangGraph**, **Hugging Face `smolagents`**, **CrewAI**, and **Amazon Bedrock / AgentCore**) from prototype into controlled production across **Snowflake**, **Informatica Cloud (IICS)**, **PostgreSQL**, and **REST microservices**.
-
-Includes an **interactive web control plane** (Tailwind CSS + Chart.js), a **JSON-RPC 2.0 MCP protocol server**, an automated **CLI benchmark runner (`run_demo.py`)**, and a **FastAPI REST server**.
+**A routing and governance gateway that sits between AI agents (Claude, GPT, open-weight models) and internal company databases, data pipelines, and APIs.**
 
 ---
 
-## 🚀 Key Technical Pillars & Capabilities
+## Overview
 
-1. **Standardized FastMCP Server & 105-Tool Semantic Router (`EnterpriseMCPRouter` & `FastMCPServer`):**
-   - Full JSON-RPC 2.0 MCP protocol handler (`initialize`, `tools/list`, `tools/call`, `resources/list`) and `@mcp.tool()` decorator registration.
-   - Pre-loaded with a **105-tool Enterprise MCP Catalog** across 7 enterprise namespaces (`snowflake.*`, `informatica.*`, `postgres.*`, `devops.*`, `supply_chain.*`, `crm_rest.*`, `knowledge_graph.*`).
-   - Hybrid **dense cosine similarity + lexical BM25 boosting** filters 105 registered tool schemas (`16,382 tokens`) down to top-$k$ per turn (`~780 tokens` at $k=5$), cutting prompt context-window bloat by **95.24%** in **<2ms**.
+Connecting an AI agent to 5 tools in a local prototype is straightforward. Scaling that same agent to **100+ internal tools** across a company (Snowflake, Informatica, PostgreSQL, Jira, GitHub, ERP systems) usually breaks down in three places:
 
-2. **Deterministic OAuth2 RBAC & Stateful Human-in-the-Loop (HITL) Interrupt Queue:**
-   - Enforces granular role-based access control (`analyst`, `ai_platform_reader`, `data_engineer`, `compliance_officer`, `platform_admin`) before tool invocation.
-   - Intercepts mutating tool executions (`is_mutating=True`, e.g., outbound treasury wires, production Argo CD rollouts, Maestro worksheet overrides) and issues a stateful **HITL Interrupt Ticket** (`PENDING_APPROVAL` $\rightarrow$ `APPROVED` / `REJECTED`) with full audit trail logging.
+1. **Tool Schema Bloat in the Prompt:**
+   Whenever an LLM uses tool-calling, the full JSON Schema definition of *every* available tool has to be injected into the prompt context on every turn. With 100+ tools across multiple connectors, you burn **~15,000+ input tokens per message** just listing tool definitions—and models start picking the wrong tool when descriptions overlap.
+   * **What this repo does:** Before calling the model, the router runs a fast hybrid search (cosine similarity + keyword matching) over the 105 registered tools and passes **only the top-$k$ relevant tool schemas** for that turn.
 
-3. **Governed Enterprise Data & Cloud Connectors (`src/connectors/`):**
-   - **Snowflake Cortex Search & Read-Only SQL AST Guard (`SnowflakeCortexConnector`):** Strips obfuscated SQL comments, blocks multi-statement semicolon injection, enforces `SELECT`/`WITH`-only execution against allow-listed schemas (`PORTFOLIO_GOLD`, `CORTEX_DOCS`), blocks mutating DDL/DML (`DROP`, `DELETE`, `UPDATE`, `INSERT`, `ALTER`, `TRUNCATE`, `GRANT`, `COPY`), and runs governed Cortex Search retrieval.
-   - **Informatica Cloud (IICS) ELT Taskflow Validator (`InformaticaCloudTaskflowAdapter`):** Validates upstream IICS ELT webhook payloads, row-count thresholds, and Snowflake staging table freshness SLAs prior to RAG vector sync—automatically locking downstream RAG indexing on pipeline failure.
-   - **PostgreSQL Transactional Ledger & Time-Travel Snapshots (`PostgresEnterpriseConnector`):** Parameterized relational queries, HITL-gated institutional wire execution, and instant point-in-time state snapshot/restore for deterministic rollback.
-   - **Resilient REST Service Gateway (`EnterpriseRESTConnector`):** Circuit-breaker state machine (`CLOSED` $\rightarrow$ `OPEN` $\rightarrow$ `HALF_OPEN`) protecting downstream enterprise APIs.
+2. **Unchecked Write Access to Production Systems:**
+   Reading a report is safe; executing an outbound bank wire, running a `DROP TABLE` query, or triggering a production deployment without human sign-off is not.
+   * **What this repo does:** Every tool call passes through a role check (**RBAC**). Read-only tools run immediately, SQL queries are inspected to block destructive commands (`DROP`, `DELETE`, `UPDATE`), and any tool marked as mutating pauses execution and creates a **Human-in-the-Loop (HITL) approval ticket** until a reviewer approves it.
 
-4. **Amazon Bedrock / AgentCore Structured Outputs & Multi-Framework Bridges (`src/adapters/`):**
-   - **Bedrock Converse API & Self-Healing Schema Verification (`BedrockAgentCoreAdapter`):** Compiles routed MCP tools into AWS Bedrock Converse `toolConfig` payloads and enforces required structured-output schema keys with automated self-healing retry prompts and token accounting.
-   - **Native Agent Framework Exporters (`AgentFrameworkBridges`):** Converts routed MCP tools directly into **LangGraph** `ToolNode` definitions, **Hugging Face `smolagents`** `CodeAgent` Python signatures, and **CrewAI** `StructuredTool` specs.
-
-5. **OpenTelemetry Tracing, Per-Use-Case Token Budgets & L2 Support Runbooks (`src/telemetry/`):**
-   - Emits W3C `traceparent` spans (`00-<trace_id>-<span_id>-01`), computes p50/p95/p99 latency percentiles, enforces per-use-case token budget alerts (`TOKEN_BUDGET_EXCEEDED`), and generates standardized **L2 Operational Support Runbooks** across 6 enterprise incident classes.
+3. **Querying Stale or Broken Data Pipelines:**
+   If an upstream ETL/ELT job (like Informatica Cloud $\rightarrow$ Snowflake) fails overnight, an AI agent won't know—it will confidently answer questions using stale or empty staging tables.
+   * **What this repo does:** It validates upstream pipeline status, row counts, and freshness SLAs before unlocking downstream RAG retrieval, and logs OpenTelemetry trace spans, per-use-case token budgets, and L2 troubleshooting runbooks.
 
 ---
 
-## 📐 System Architecture & Mathematical Grounding
+## How It Works
 
 ```
- ┌──────────────────────────────────────────────────────────────────────────────────┐
- │  Agent Runtimes: LangGraph | HF smolagents | CrewAI | Amazon Bedrock AgentCore   │
- └────────────────────────────────────────┬─────────────────────────────────────────┘
-                                          │ JSON-RPC 2.0 (tools/list, tools/call)
-                                          ▼
- ┌──────────────────────────────────────────────────────────────────────────────────┐
- │               Enterprise-MCP-Router (FastMCP Gateway Control Plane)              │
- │                                                                                  │
- │  ┌──────────────────────────────────┐    ┌────────────────────────────────────┐  │
- │  │ 1. Dense Semantic Tool Router    │    │ 2. OAuth2 RBAC & HITL Gate         │  │
- │  │ • 105 Enterprise Tools (16.4k t) │───▶│ • Role Scope Verification          │  │
- │  │ • Top-k Hybrid Filter (~780 t)   │    │ • Stateful HITL Interrupt Queue    │  │
- │  │ • 95.2% Context Token Reduction  │    │   (PENDING -> APPROVED / REJECTED) │  │
- │  └──────────────────────────────────┘    └─────────────────┬──────────────────┘  │
- └────────────────────────────────────────────────────────────┼─────────────────────┘
-                                                              │ Authorized Call
-        ┌─────────────────────────┬───────────────────────────┼────────────────────┐
-        ▼                         ▼                           ▼                    ▼
- ┌──────────────┐        ┌─────────────────┐         ┌────────────────┐   ┌────────────────┐
- │  Snowflake   │        │ Informatica IICS│         │   PostgreSQL   │   │ OpenTelemetry  │
- │ Cortex + SQL │        │  ELT SLA Gate   │         │ Ledger & Snaps │   │ & L2 Runbooks  │
- │ Allow-Lister │        │ (RAG Sync Lock) │         │ (Time-Travel)  │   │ (Token Budget) │
- └──────────────┘        └─────────────────┘         └────────────────┘   └────────────────┘
-```
-
-### 1. Hybrid Dense + Lexical Semantic Routing Score
-To prevent context-window degradation and tool-selection hallucination when scaling past 100+ enterprise tools, each tool $t_i \in \mathcal{T}$ is embedded into a unit-normalized vector $\mathbf{e}_i \in \mathbb{R}^d$. Given an agent turn query $q$ with normalized embedding $\mathbf{e}_q$ and query token set $W_q$, the router scores each tool via:
-
-$$S(q, t_i) = \alpha \left( \frac{\mathbf{e}_q \cdot \mathbf{e}_i}{\|\mathbf{e}_q\|_2 \|\mathbf{e}_i\|_2} \right) + \min\left(\gamma_{\max}, \; \beta \sum_{w \in W_q} \mathbb{I}[w \in \text{desc}(t_i)]\right)$$
-
-### 2. Context-Window Token Savings Ratio
-Let $\tau(t_i)$ denote the JSON Schema token footprint of tool $t_i$. Filtering the full registry $\mathcal{T}$ ($|\mathcal{T}| = 105$) down to the top-$k$ subset $\mathcal{T}_k$ yields a per-turn prompt token reduction of:
-
-$$\text{Token Reduction (\%)} = \left( 1 - \frac{\sum_{t \in \mathcal{T}_k} \tau(t)}{\sum_{t \in \mathcal{T}} \tau(t)} \right) \times 100\%$$
-
----
-
-## 📊 Empirical Benchmarks (105-Tool Enterprise Registry)
-
-| Top-$k$ Routed Tools | Full Registry Tokens (105 Tools) | Routed Schema Tokens | Context Token Reduction | Router Latency (p95) | Top-1 Domain Recall@k |
-|---|---|---|---|---|---|
-| **$k = 3$ Tools** | 16,382 tokens | **472 tokens** | **97.12%** | 1.62 ms | 99.1% |
-| **$k = 5$ Tools (Default)** | 16,382 tokens | **780 tokens** | **95.24%** | 1.85 ms | 100.0% |
-| **$k = 8$ Tools** | 16,382 tokens | **1,246 tokens** | **92.39%** | 2.04 ms | 100.0% |
-| **$k = 10$ Tools** | 16,382 tokens | **1,558 tokens** | **90.49%** | 2.18 ms | 100.0% |
-
----
-
-## 📁 Repository Structure
-
-```
-enterprise-mcp-router/
-├── .github/
-│   └── workflows/
-│       └── ci.yml                      # GitHub Actions CI across Python 3.10, 3.11, 3.12
-├── src/
-│   ├── __init__.py
-│   ├── main.py                         # FastAPI server, REST API & JSON-RPC 2.0 endpoints
-│   ├── models.py                       # Pydantic v2 request/response data contracts
-│   ├── router.py                       # EnterpriseMCPRouter, FastMCPServer & HITL state machine
-│   ├── dashboard_html.py               # Interactive Web Control Plane UI (Tailwind + Chart.js)
-│   ├── registry/
-│   │   ├── __init__.py
-│   │   └── catalog.py                  # 105-tool Enterprise MCP Catalog across 7 domains
-│   ├── connectors/
-│   │   ├── __init__.py
-│   │   └── data_connectors.py          # Snowflake Cortex, Informatica IICS, PostgreSQL, REST
-│   ├── adapters/
-│   │   ├── __init__.py
-│   │   └── agent_adapters.py           # Amazon Bedrock AgentCore & LangGraph/smolagents/CrewAI
-│   └── telemetry/
-│       ├── __init__.py
-│       └── observability.py            # OpenTelemetry spans, token budgets & L2 runbooks
-├── tests/
-│   ├── test_router.py                  # Core routing, RBAC/HITL, connectors & adapter unit tests
-│   └── test_api.py                     # FastAPI REST & JSON-RPC 2.0 integration tests
-├── run_demo.py                         # End-to-end CLI benchmark & simulation runner
-├── Dockerfile                          # Production container image definition
-├── requirements.txt                    # Runtime & test dependencies
-├── pyproject.toml                      # PEP 517/518 package configuration
-├── pytest.ini                          # Pytest runner configuration
-├── LICENSE                             # MIT License
-└── README.md                           # Project documentation
+User / Agent Question
+   │  "Check Fidelity RRSP rules in Snowflake and get fund NAV"
+   ▼
+1. Semantic Router ──▶ Scores 105 registered tools across 7 connectors (<2ms)
+   │                    and passes only the top-k tool schemas to the LLM prompt
+   ▼
+2. Permission Gate ──▶ Checks caller RBAC role. Does the tool modify data?
+   │                    ├─ No (Read-Only) ──▶ Executes tool immediately
+   │                    └─ Yes (Mutating) ──▶ Pauses & queues a Human Approval Ticket
+   ▼
+3. Safe Connectors ──▶ Snowflake (SELECT-only guard & Cortex Search)
+   │                   Informatica IICS (ELT freshness & row-count gate)
+   │                   PostgreSQL (Parameterized queries & 1-click table snapshots)
+   ▼
+4. Trace & Alerts  ──▶ Logs W3C traceparent spans, token budgets, and L2 runbooks
 ```
 
 ---
 
-## 🛠️ Quickstart & Reproduction
+## Quickstart
 
-### 1. Install Dependencies
 ```bash
 git clone https://github.com/ahmedshahrukhali/enterprise-mcp-router.git
 cd enterprise-mcp-router
 pip install -r requirements.txt
-```
 
-### 2. Launch the Interactive Web Control Plane
-Start the FastAPI server and open `http://localhost:8000` in your browser:
-```bash
+# 1. Launch the interactive web control plane at http://localhost:8000
 uvicorn src.main:app --reload --port 8000
-```
 
-### 3. Run the End-to-End CLI Benchmark Suite
-```bash
+# 2. Run the terminal benchmark & simulation runner
 python run_demo.py
-```
 
-### 4. Run the Automated Test Suite
-```bash
+# 3. Run the 14 automated unit & API tests
 pytest -v
 ```
 
 ---
 
-## 🌐 REST & JSON-RPC 2.0 API Reference
+## What's Inside the Interactive Dashboard (`http://localhost:8000`)
 
-Interactive OpenAPI documentation is available at `http://localhost:8000/docs`:
-
-| Method | Endpoint | Description |
-|---|---|---|
-| `GET` | `/` | Serves the interactive 5-tab Enterprise MCP Control Plane dashboard |
-| `GET` | `/health` | Returns service health, 105-tool count, pending HITL tickets, and RAG lock status |
-| `POST` | `/mcp/jsonrpc` | Standardized MCP JSON-RPC 2.0 endpoint (`initialize`, `tools/list`, `tools/call`, `resources/list`) |
-| `POST` | `/api/v1/router/search` | Routes natural language intent to top-$k$ MCP tools and computes token reduction |
-| `POST` | `/api/v1/governance/authorize` | Evaluates deterministic OAuth2 RBAC and HITL approval gates |
-| `GET` | `/api/v1/governance/hitl` | Lists pending and resolved Human-in-the-Loop (HITL) interrupt tickets |
-| `POST` | `/api/v1/governance/hitl/create` | Creates a stateful HITL approval ticket for a mutating MCP tool |
-| `POST` | `/api/v1/governance/hitl/resolve` | Approves or rejects a pending HITL interrupt ticket |
-| `POST` | `/api/v1/connectors/snowflake/validate-sql` | Validates Snowflake SQL against RBAC, schema allow-list, and DDL/DML blocklist |
-| `POST` | `/api/v1/connectors/snowflake/cortex-search` | Runs governed Snowflake Cortex Search retrieval over compliance docs |
-| `POST` | `/api/v1/connectors/informatica/validate` | Validates Informatica Cloud (IICS) ELT taskflow SLA and row counts prior to RAG sync |
-| `POST` | `/api/v1/connectors/postgres/query` | Executes parameterized read-only SQL against the PostgreSQL institutional ledger |
-| `POST` | `/api/v1/connectors/postgres/snapshot/create` | Creates a point-in-time state snapshot of the PostgreSQL ledger |
-| `POST` | `/api/v1/connectors/postgres/snapshot/restore` | Restores PostgreSQL tables to a verified point-in-time snapshot |
-| `POST` | `/api/v1/adapters/bedrock/invoke` | Invokes Amazon Bedrock / AgentCore with structured output verification & self-healing retry |
-| `GET` | `/api/v1/adapters/bridges/{framework}` | Exports routed MCP tools into `langgraph`, `smolagents`, or `crewai` tool schemas |
-| `GET` | `/api/v1/telemetry/summary` | Returns OpenTelemetry latency percentiles (p50/p95/p99), spans, and token budget alerts |
-| `POST` | `/api/v1/telemetry/runbook` | Generates standardized L2 operational support runbooks for incident triage |
+* **Tab 1 — Semantic Tool Router:** Type any plain-English task (or click a preset) and watch how it scores the 105 tools across domains and trims the prompt schema footprint.
+* **Tab 2 — RBAC & Human Approval Queue:** Test how read-only vs. mutating tools behave under different user roles (`analyst`, `data_engineer`, `platform_admin`), and approve or reject queued agent actions.
+* **Tab 3 — Data Connectors (Snowflake, Informatica, Postgres):** Test the read-only SQL filter against `DROP TABLE` injection, check Informatica ELT pipeline SLAs, and test instant Postgres table snapshots/rollbacks.
+* **Tab 4 — Bedrock & Framework Bridges:** Export routed tools directly into **Amazon Bedrock (`toolConfig`)**, **LangGraph (`ToolNode`)**, **Hugging Face `smolagents`**, or **CrewAI**, and test automatic retry when a model output misses a required JSON field.
+* **Tab 5 — Telemetry & Runbooks:** Inspect W3C trace spans, per-use-case token budget alerts, and step-by-step L2 incident triage guides.
 
 ---
 
-## 📄 License
-MIT License. Copyright (c) 2026 Ahmed S. Ali.
+## Understanding the Token Savings & Routing Tradeoff
+
+In standard LLM tool-calling, every tool in your registry adds roughly **140–160 tokens** of JSON Schema metadata (`name`, `description`, parameter types, enums) to the system prompt on every turn. Across 105 tools in 7 domains, sending the full catalog costs **15,878 tokens per turn** before the user even says hello.
+
+By filtering the catalog down to the **top-$k$ tools** matching the user's intent, we avoid sending irrelevant connector schemas (for example, omitting DevOps and CRM tool schemas when the user asks a Snowflake finance question):
+
+| Routed Subset ($k$) | Full Catalog Schema Tokens | Routed Schema Tokens | Prompt Schema Reduction | Router Latency | Recommended Use Case |
+|---|---|---|---|---|---|
+| **Top-3 Tools** | 15,878 tokens | **472 tokens** | **97.0%** | 1.6 ms | Single-domain lookups (e.g., pure SQL or doc search) |
+| **Top-5 Tools (Default)** | 15,878 tokens | **758 tokens** | **95.2%** | 1.8 ms | Standard single- or two-step agent turns |
+| **Top-8 Tools** | 15,878 tokens | **1,218 tokens** | **92.3%** | 2.0 ms | Cross-connector workflows (e.g., Informatica + Snowflake) |
+| **Top-10 Tools** | 15,878 tokens | **1,520 tokens** | **90.4%** | 2.1 ms | Broad multi-hop investigation across 3+ systems |
+
+> **Design Note on Recall vs. Context Size:** Because aggressive filtering ($k=3$) can occasionally miss a secondary tool needed for a multi-system query, `top_k` is configurable per request (`1` to `25`) and supports optional `domain_filter` scoping or full catalog listing via the MCP `tools/list` endpoint.
+
+---
+
+## Project Structure
+
+```
+enterprise-mcp-router/
+├── .github/workflows/ci.yml        # GitHub Actions CI (Python 3.10, 3.11, 3.12)
+├── src/
+│   ├── main.py                     # FastAPI server, REST API & JSON-RPC 2.0 endpoints
+│   ├── models.py                   # Pydantic v2 request/response schemas
+│   ├── router.py                   # EnterpriseMCPRouter, FastMCPServer & HITL queue
+│   ├── dashboard_html.py           # Interactive Web Control Plane UI (Tailwind + Chart.js)
+│   ├── registry/catalog.py         # 105 enterprise tools across 7 domains
+│   ├── connectors/data_connectors.py # Snowflake, Informatica IICS, PostgreSQL, REST
+│   ├── adapters/agent_adapters.py  # Amazon Bedrock Converse API & LangGraph/smolagents/CrewAI
+│   └── telemetry/observability.py  # OpenTelemetry spans, token budgets & L2 runbooks
+├── tests/
+│   ├── test_router.py              # Routing, RBAC/HITL, connectors & adapter unit tests
+│   └── test_api.py                 # FastAPI REST & JSON-RPC 2.0 integration tests
+├── run_demo.py                     # CLI benchmark & simulation runner
+├── Dockerfile                      # Container image definition
+├── requirements.txt                # Runtime & test dependencies
+└── pyproject.toml                  # Package configuration
+```
+
+---
+
+## REST & JSON-RPC 2.0 Endpoints
+
+Interactive OpenAPI docs are served at `http://localhost:8000/docs`:
+
+| Method | Endpoint | Description |
+|---|---|---|
+| `GET` | `/` | Interactive 5-tab Enterprise MCP Control Plane dashboard |
+| `GET` | `/health` | Service health, 105-tool count, pending HITL tickets, and RAG lock status |
+| `POST` | `/mcp/jsonrpc` | MCP JSON-RPC 2.0 endpoint (`initialize`, `tools/list`, `tools/call`, `resources/list`) |
+| `POST` | `/api/v1/router/search` | Routes natural language intent to top-$k$ MCP tools and reports token savings |
+| `POST` | `/api/v1/governance/authorize` | Evaluates RBAC role permissions and HITL approval status |
+| `GET` | `/api/v1/governance/hitl` | Lists pending and resolved Human-in-the-Loop (HITL) approval tickets |
+| `POST` | `/api/v1/governance/hitl/create` | Queues a new HITL approval ticket for a mutating tool call |
+| `POST` | `/api/v1/governance/hitl/resolve` | Approves or rejects a pending HITL ticket |
+| `POST` | `/api/v1/connectors/snowflake/validate-sql` | Checks Snowflake SQL against RBAC, schema allow-list, and DDL/DML blocklist |
+| `POST` | `/api/v1/connectors/snowflake/cortex-search` | Runs governed Snowflake Cortex Search retrieval over compliance docs |
+| `POST` | `/api/v1/connectors/informatica/validate` | Checks Informatica Cloud (IICS) ELT status, row counts, and freshness lag |
+| `POST` | `/api/v1/connectors/postgres/query` | Runs read-only SQL queries against the PostgreSQL ledger |
+| `POST` | `/api/v1/connectors/postgres/snapshot/create` | Saves a point-in-time state snapshot of the PostgreSQL ledger |
+| `POST` | `/api/v1/connectors/postgres/snapshot/restore` | Restores PostgreSQL tables to a saved snapshot |
+| `POST` | `/api/v1/adapters/bedrock/invoke` | Simulates Amazon Bedrock structured output verification with automatic retry |
+| `GET` | `/api/v1/adapters/bridges/{framework}` | Exports routed tools into `langgraph`, `smolagents`, or `crewai` formats |
+| `GET` | `/api/v1/telemetry/summary` | Returns OpenTelemetry latency percentiles, trace spans, and token alerts |
+| `POST` | `/api/v1/telemetry/runbook` | Generates step-by-step L2 troubleshooting runbooks |
+
+---
+
+## License
+MIT License — Copyright (c) 2026 Ahmed S. Ali
