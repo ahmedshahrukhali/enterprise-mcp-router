@@ -11,7 +11,7 @@ import json
 import os
 import sqlite3
 import tempfile
-import time
+
 import pytest
 from fastapi.testclient import TestClient
 
@@ -539,9 +539,8 @@ def test_identity_fail_closed_startup_and_disabled_demo_keys(monkeypatch):
     with pytest.raises(RuntimeError):
         validate_security_config()
 
-    with pytest.raises(RuntimeError):
-        with TestClient(app):
-            pass
+    with pytest.raises(RuntimeError), TestClient(app):
+        pass
 
     monkeypatch.setenv("ROUTER_JWT_SECRET", "prod-test-secret-key-at-least-32-bytes-long")
     with TestClient(app) as client:

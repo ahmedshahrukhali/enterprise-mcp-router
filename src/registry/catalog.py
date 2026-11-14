@@ -17,18 +17,19 @@ import json
 import math
 import re
 from collections import Counter
-from typing import Any, Dict, Iterable, List, Tuple
+from collections.abc import Iterable
+from typing import Any
 
 try:
     import tiktoken  # type: ignore[import-not-found]
     _TIKTOKEN_ENC: Any = tiktoken.get_encoding("cl100k_base")
-except Exception:
+except (ImportError, OSError, ValueError):
     _TIKTOKEN_ENC = None
 
 _BPE_FALLBACK_RE = re.compile(r"[A-Za-z0-9_]{1,6}|[^\sA-Za-z0-9_]")
 
 
-DOMAIN_KEYWORDS: Dict[str, List[str]] = {
+DOMAIN_KEYWORDS: dict[str, list[str]] = {
     "snowflake": [
         "snowflake", "cortex", "sql", "warehouse", "fund", "nav", "rrsp",
         "portfolio", "gold", "schema", "table", "query", "select", "aum",
@@ -79,20 +80,20 @@ DOMAIN_ORDER = [
 _TOKEN_RE = re.compile(r"[a-z0-9]+")
 
 
-def tokenize_text(text: str) -> List[str]:
+def tokenize_text(text: str) -> list[str]:
     """Extracts normalized lowercase alphanumeric tokens for BM25 and hashing."""
     normalized = text.replace("_", " ").replace(".", " ").replace("-", " ").replace("/", " ")
     return [tok for tok in _TOKEN_RE.findall(normalized.lower()) if len(tok) > 1]
 
 
-def _normalize(vec: List[float]) -> List[float]:
+def _normalize(vec: list[float]) -> list[float]:
     norm = math.sqrt(sum(v * v for v in vec))
     if norm < 1e-9:
         return [1.0 / math.sqrt(len(vec)) for _ in vec]
     return [round(v / norm, 6) for v in vec]
 
 
-def compute_query_embedding(text: str) -> List[float]:
+def compute_query_embedding(text: str) -> list[float]:
     """
     Computes a deterministic 64-dimensional L2-normalized dense semantic embedding:
       - Dims 0..7   : Enterprise domain affinity across the 8 domains
@@ -103,7 +104,7 @@ def compute_query_embedding(text: str) -> List[float]:
     token_set = set(tokens)
 
     # First 8 dimensions correspond to the 8 enterprise domains
-    vec: List[float] = []
+    vec: list[float] = []
     for dom in DOMAIN_ORDER:
         kw_list = DOMAIN_KEYWORDS[dom]
         hits = sum(
@@ -133,7 +134,7 @@ def compute_query_embedding(text: str) -> List[float]:
     # Dimensions 20..63: 44-dim signed SHA-256 feature hashing over unigrams, bigrams & char 4-grams
     hash_dims = 44
     hashed = [0.0] * hash_dims
-    grams: List[Tuple[str, float]] = []
+    grams: list[tuple[str, float]] = []
     for tok in tokens:
         grams.append((f"w:{tok}", 1.0))
         if len(tok) >= 4:
@@ -158,11 +159,11 @@ class OkapiBM25Index:
     Computes corpus IDF weights and length-normalized TF scoring without external dependencies.
     """
 
-    def __init__(self, documents: Iterable[Tuple[str, str]], k1: float = 1.5, b: float = 0.75):
+    def __init__(self, documents: Iterable[tuple[str, str]], k1: float = 1.5, b: float = 0.75):
         self.k1 = k1
         self.b = b
-        self._doc_tf: Dict[str, Counter[str]] = {}
-        self._doc_len: Dict[str, int] = {}
+        self._doc_tf: dict[str, Counter[str]] = {}
+        self._doc_len: dict[str, int] = {}
         self._df: Counter[str] = Counter()
 
         for doc_id, text in documents:
@@ -170,7 +171,7 @@ class OkapiBM25Index:
             tf = Counter(tokens)
             self._doc_tf[doc_id] = tf
             self._doc_len[doc_id] = len(tokens)
-            for term in tf.keys():
+            for term in tf:
                 self._df[term] += 1
 
         self.num_docs = len(self._doc_tf)
@@ -213,7 +214,7 @@ class OkapiBM25Index:
 
 
 # 15 curated tools per domain * 8 domains = 120 Enterprise MCP Tools
-_DOMAIN_TOOL_TEMPLATES: Dict[str, List[Tuple[str, str, bool, str]]] = {
+_DOMAIN_TOOL_TEMPLATES: dict[str, list[tuple[str, str, bool, str]]] = {
     "snowflake": [
         ("snowflake.cortex_search_docs", "Search Snowflake Cortex Search vector index over compliance policies, RRSP rules, and fund prospectuses", False, "ai_platform_reader"),
         ("snowflake.execute_readonly_sql", "Execute governed read-only SELECT query on Snowflake PORTFOLIO_GOLD and CORTEX_DOCS schemas", False, "ai_platform_reader"),
@@ -353,7 +354,7 @@ _DOMAIN_TOOL_TEMPLATES: Dict[str, List[Tuple[str, str, bool, str]]] = {
 }
 
 
-def count_schema_tokens(tool_name: str, description: str, input_schema: Dict[str, Any]) -> int:
+def count_schema_tokens(tool_name: str, description: str, input_schema: dict[str, Any]) -> int:
     """
     Measures token count of the serialized MCP tool definition (`name`, `description`, `inputSchema`).
     Uses tiktoken `cl100k_base` when installed, or deterministic cl100k-equivalent BPE/punctuation chunks.
@@ -372,7 +373,7 @@ def count_schema_tokens(tool_name: str, description: str, input_schema: Dict[str
     return len(_BPE_FALLBACK_RE.findall(serialized))
 
 
-def _build_tool_input_schema(name: str, domain: str) -> Dict[str, Any]:
+def _build_tool_input_schema(name: str, domain: str) -> dict[str, Any]:
     """Builds realistic, domain-specific JSON Schema Draft-07 contracts per MCP tool."""
     env_prop = {
         "type": "string",
@@ -469,12 +470,12 @@ def _build_tool_input_schema(name: str, domain: str) -> Dict[str, Any]:
     }
 
 
-def get_enterprise_tool_catalog() -> List[Dict[str, Any]]:
+def get_enterprise_tool_catalog() -> list[dict[str, Any]]:
     """
     Returns the complete 120-tool Enterprise MCP Catalog with 64-dim embeddings,
     JSON Schema input contracts, RBAC roles, and real serialized schema token counts.
     """
-    catalog: List[Dict[str, Any]] = []
+    catalog: list[dict[str, Any]] = []
     for domain in DOMAIN_ORDER:
         templates = _DOMAIN_TOOL_TEMPLATES[domain]
         for name, desc, is_mutating, role in templates:

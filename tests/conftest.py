@@ -9,10 +9,13 @@ Runs BEFORE test module collection so `src.main` imports in test modules use:
 """
 
 import atexit
+import logging
 import os
-from pathlib import Path
+import sqlite3
 import tempfile
+from pathlib import Path
 
+_logger = logging.getLogger(__name__)
 _TEST_DB_DIR = tempfile.TemporaryDirectory(prefix="mcp_router_pytest_")
 _TEST_DB_PATH = str(Path(_TEST_DB_DIR.name) / "pytest_router.db")
 
@@ -29,12 +32,12 @@ def _cleanup_test_db_dir() -> None:
         if callable(close_fn):
             close_fn()
         reset_default_storage(None)
-    except Exception:
-        pass
+    except (ImportError, OSError, RuntimeError, sqlite3.Error) as exc:
+        _logger.debug("Skipped storage cleanup on exit: %s", exc)
     try:
         _TEST_DB_DIR.cleanup()
-    except Exception:
-        pass
+    except OSError as exc:
+        _logger.debug("Skipped temp DB directory cleanup on exit: %s", exc)
 
 
 atexit.register(_cleanup_test_db_dir)

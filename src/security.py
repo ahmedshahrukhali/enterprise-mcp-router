@@ -7,16 +7,20 @@ import base64
 import hashlib
 import hmac
 import json
+import logging
 import os
 import secrets
 import threading
 import time
 from collections import deque
-from typing import Any, Deque, Dict, List, Optional, Set, Tuple
+from typing import Annotated, Any, ClassVar
+
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding, rsa
 from fastapi import Depends, Header, HTTPException
 from pydantic import BaseModel, Field
+
+logger = logging.getLogger(__name__)
 
 _EPHEMERAL_DEV_SECRET = secrets.token_hex(32)
 
@@ -45,7 +49,7 @@ def validate_security_config() -> None:
         )
 
 
-ROLE_HIERARCHY: Dict[str, Set[str]] = {
+ROLE_HIERARCHY: dict[str, set[str]] = {
     "super_admin": {
         "super_admin",
         "platform_admin",
@@ -75,25 +79,25 @@ ROLE_HIERARCHY: Dict[str, Set[str]] = {
 }
 
 
-def expand_allowed_roles(user_roles: Optional[List[str]]) -> Set[str]:
+def expand_allowed_roles(user_roles: list[str] | None) -> set[str]:
     """Expands a caller's roles across the deterministic RBAC hierarchy."""
     if not user_roles:
         return set()
-    allowed: Set[str] = set()
+    allowed: set[str] = set()
     for role in user_roles:
         allowed.add(role)
         allowed.update(ROLE_HIERARCHY.get(role, set()))
     return allowed
 
 
-def is_role_authorized(required_role: str, user_roles: Optional[List[str]]) -> bool:
+def is_role_authorized(required_role: str, user_roles: list[str] | None) -> bool:
     """Checks whether `user_roles` satisfies `required_role` under hierarchy rules."""
     if not user_roles:
         return False
     return required_role in expand_allowed_roles(user_roles)
 
 
-def _get_jwt_secret(allow_missing: bool = False) -> Optional[str]:
+def _get_jwt_secret(allow_missing: bool = False) -> str | None:
     configured = os.environ.get("ROUTER_JWT_SECRET", "").strip()
     if configured:
         return configured
@@ -125,7 +129,7 @@ def _b64url_to_int(val: str) -> int:
     return int.from_bytes(_b64url_decode(val), "big")
 
 
-def generate_rsa_keypair_and_jwks(kid: str = "idp-rsa-1") -> Dict[str, Any]:
+def generate_rsa_keypair_and_jwks(kid: str = "idp-rsa-1") -> dict[str, Any]:
     """Generates an RSA-2048 keypair and corresponding OIDC JWKS document for RS256 verification."""
     private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
     public_key = private_key.public_key()
@@ -156,12 +160,12 @@ def generate_rsa_keypair_and_jwks(kid: str = "idp-rsa-1") -> Dict[str, Any]:
 
 def create_jwt_token(
     username: str,
-    roles: List[str],
+    roles: list[str],
     expires_in_seconds: int = 3600,
-    secret: Optional[str] = None,
-    groups: Optional[List[str]] = None,
-    issuer: Optional[str] = None,
-    audience: Optional[str] = None,
+    secret: str | None = None,
+    groups: list[str] | None = None,
+    issuer: str | None = None,
+    audience: str | None = None,
 ) -> str:
     """Mints an RFC 7519 HS256 JWT bearing subject, RBAC roles, groups, iss, and aud."""
     resolved_secret = secret if secret is not None else _get_jwt_secret()
@@ -188,16 +192,18 @@ def create_jwt_token(
 
 def create_rs256_jwt_token(
     username: str,
-    roles: List[str],
+    roles: list[str],
     private_pem: str,
     expires_in_seconds: int = 3600,
-    groups: Optional[List[str]] = None,
+    groups: list[str] | None = None,
     kid: str = "idp-rsa-1",
-    issuer: Optional[str] = None,
-    audience: Optional[str] = None,
+    issuer: str | None = None,
+    audience: str | None = None,
 ) -> str:
     """Mints an RS256 OIDC JWT signed by an RSA private key."""
     private_key = serialization.load_pem_private_key(private_pem.encode("utf-8"), password=None)
+    if not isinstance(private_key, rsa.RSAPrivateKey):
+        raise TypeError("RSA private key required for RS256 token signing.")
     now = int(time.time())
     header = {"alg": "RS256", "typ": "JWT", "kid": kid}
     payload = {
@@ -212,14 +218,14 @@ def create_rs256_jwt_token(
     header_b64 = _b64url_encode(json.dumps(header, separators=(",", ":")).encode("utf-8"))
     payload_b64 = _b64url_encode(json.dumps(payload, separators=(",", ":")).encode("utf-8"))
     signing_input = f"{header_b64}.{payload_b64}".encode("ascii")
-    sig = private_key.sign(signing_input, padding.PKCS1v15(), hashes.SHA256())  # type: ignore[union-attr]
+    sig = private_key.sign(signing_input, padding.PKCS1v15(), hashes.SHA256())
     return f"{header_b64}.{payload_b64}.{_b64url_encode(sig)}"
 
 
 def _load_rsa_public_key_for_token(
-    header: Dict[str, Any],
-    public_key_pem: Optional[str],
-    jwks: Optional[Dict[str, Any]],
+    header: dict[str, Any],
+    public_key_pem: str | None,
+    jwks: dict[str, Any] | None,
 ) -> Any:
     pem = public_key_pem or os.environ.get("ROUTER_JWT_PUBLIC_KEY_PEM", "").strip()
     if pem:
@@ -245,12 +251,12 @@ def _load_rsa_public_key_for_token(
 
 def verify_jwt_token(
     token: str,
-    secret: Optional[str] = None,
-    public_key_pem: Optional[str] = None,
-    jwks: Optional[Dict[str, Any]] = None,
-    expected_issuer: Optional[str] = None,
-    expected_audience: Optional[str] = None,
-) -> Dict[str, Any]:
+    secret: str | None = None,
+    public_key_pem: str | None = None,
+    jwks: dict[str, Any] | None = None,
+    expected_issuer: str | None = None,
+    expected_audience: str | None = None,
+) -> dict[str, Any]:
     """Verifies an HS256 or RS256/JWKS JWT signature, expiration, subject, iss, and aud."""
     parts = token.split(".")
     if len(parts) != 3:
@@ -308,8 +314,8 @@ def verify_jwt_token(
 
 class AuthenticatedPrincipal(BaseModel):
     username: str
-    roles: List[str] = Field(default_factory=list)
-    groups: List[str] = Field(default_factory=list)
+    roles: list[str] = Field(default_factory=list)
+    groups: list[str] = Field(default_factory=list)
     is_authenticated: bool = True
     auth_scheme: str = "jwt"
 
@@ -320,7 +326,7 @@ class AuthenticatedPrincipal(BaseModel):
 # Development-only demo API keys (disabled by default unless ROUTER_DEV_MODE=1 or ROUTER_ENABLE_DEMO_KEYS=1).
 # Notice operators (`ak-admin-demo`) belong to `platform_operators`, while the designated
 # peer approver (`ak-superadmin-demo`) belongs strictly to `hitl_approvers`.
-DEFAULT_PRINCIPALS: Dict[str, AuthenticatedPrincipal] = {
+DEFAULT_PRINCIPALS: dict[str, AuthenticatedPrincipal] = {
     "ak-analyst-demo": AuthenticatedPrincipal(
         username="analyst_user",
         roles=["analyst"],
@@ -348,9 +354,9 @@ DEFAULT_PRINCIPALS: Dict[str, AuthenticatedPrincipal] = {
 }
 
 
-def get_configured_principals() -> Dict[str, AuthenticatedPrincipal]:
+def get_configured_principals() -> dict[str, AuthenticatedPrincipal]:
     """Loads API key principals from ROUTER_API_KEYS env; demo keys only in dev mode."""
-    principals: Dict[str, AuthenticatedPrincipal] = {}
+    principals: dict[str, AuthenticatedPrincipal] = {}
     demo_keys_enabled = is_dev_mode() or os.environ.get("ROUTER_ENABLE_DEMO_KEYS", "").lower() in ("1", "true", "yes")
     if demo_keys_enabled:
         principals.update(DEFAULT_PRINCIPALS)
@@ -366,15 +372,15 @@ def get_configured_principals() -> Dict[str, AuthenticatedPrincipal]:
                     groups=v.get("groups", []),
                     auth_scheme="api_key",
                 )
-        except Exception:
-            pass
+        except (json.JSONDecodeError, TypeError, ValueError) as exc:
+            logger.warning("Ignoring malformed ROUTER_API_KEYS JSON: %s", exc)
     return principals
 
 
 def extract_token_from_headers(
-    x_api_key: Optional[str] = Header(None, alias="X-API-Key"),
-    authorization: Optional[str] = Header(None, alias="Authorization"),
-) -> Optional[str]:
+    x_api_key: str | None = Header(None, alias="X-API-Key"),
+    authorization: str | None = Header(None, alias="Authorization"),
+) -> str | None:
     """Extracts bearer token or API key from request headers."""
     if x_api_key:
         return x_api_key.strip()
@@ -387,8 +393,8 @@ def extract_token_from_headers(
 
 
 def get_current_principal(
-    x_api_key: Optional[str] = Header(None, alias="X-API-Key"),
-    authorization: Optional[str] = Header(None, alias="Authorization"),
+    x_api_key: str | None = Header(None, alias="X-API-Key"),
+    authorization: str | None = Header(None, alias="Authorization"),
 ) -> AuthenticatedPrincipal:
     """
     FastAPI dependency verifying caller identity via HS256/RS256 JWT or configured API key.
@@ -447,9 +453,9 @@ class SlidingWindowRateLimiter:
     def __init__(self, default_rpm: int = 300):
         self.default_rpm = default_rpm
         self._lock = threading.Lock()
-        self._requests: Dict[str, Deque[float]] = {}
+        self._requests: dict[str, deque[float]] = {}
 
-    def check(self, key: str, limit_rpm: Optional[int] = None) -> Tuple[bool, int]:
+    def check(self, key: str, limit_rpm: int | None = None) -> tuple[bool, int]:
         limit = limit_rpm if limit_rpm is not None else int(os.environ.get("ROUTER_RATE_LIMIT_RPM", str(self.default_rpm)))
         now = time.time()
         window_start = now - 60.0
@@ -471,7 +477,7 @@ DEFAULT_RATE_LIMITER = SlidingWindowRateLimiter()
 
 
 def enforce_rate_limit(
-    principal: AuthenticatedPrincipal = Depends(get_current_principal),
+    principal: Annotated[AuthenticatedPrincipal, Depends(get_current_principal)],
 ) -> AuthenticatedPrincipal:
     """FastAPI dependency enforcing per-principal rate limits."""
     allowed, _ = DEFAULT_RATE_LIMITER.check(f"{principal.auth_scheme}:{principal.username}")
@@ -483,11 +489,11 @@ def enforce_rate_limit(
 class HITLGovernanceRules:
     """Security rules governing Human-in-the-Loop approval workflows."""
 
-    ALLOWED_APPROVER_ROLES: Set[str] = {"super_admin", "platform_admin", "compliance_officer", "hitl_approver"}
+    ALLOWED_APPROVER_ROLES: ClassVar[set[str]] = {"super_admin", "platform_admin", "compliance_officer", "hitl_approver"}
     REQUIRED_APPROVER_GROUP: str = "hitl_approvers"
 
     @staticmethod
-    def compute_arguments_hash(tool_name: str, arguments: Optional[Dict[str, Any]] = None) -> str:
+    def compute_arguments_hash(tool_name: str, arguments: dict[str, Any] | None = None) -> str:
         """Computes a canonical SHA-256 binding hash over tool_name and arguments."""
         canonical_payload = {
             "tool_name": tool_name,
@@ -499,11 +505,11 @@ class HITLGovernanceRules:
     @classmethod
     def validate_resolution(
         cls,
-        ticket: Dict[str, Any],
+        ticket: dict[str, Any],
         reviewer: str,
-        reviewer_roles: Optional[List[str]] = None,
-        reviewer_groups: Optional[List[str]] = None,
-    ) -> Tuple[bool, Optional[str]]:
+        reviewer_roles: list[str] | None = None,
+        reviewer_groups: list[str] | None = None,
+    ) -> tuple[bool, str | None]:
         """
         Validates whether a reviewer is allowed to approve/reject a ticket.
         Enforces separation of duties (no self-approval), approver role check,
@@ -537,10 +543,10 @@ class HITLGovernanceRules:
     @classmethod
     def validate_consumption(
         cls,
-        ticket: Dict[str, Any],
+        ticket: dict[str, Any],
         tool_name: str,
-        arguments: Optional[Dict[str, Any]] = None,
-    ) -> Tuple[bool, Optional[str]]:
+        arguments: dict[str, Any] | None = None,
+    ) -> tuple[bool, str | None]:
         """
         Validates that a ticket can be consumed to authorize tool execution.
         Enforces expiration, single-use replay prevention, tool target matching,

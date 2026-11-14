@@ -11,24 +11,17 @@ Exposes:
 - OpenTelemetry Tracing, Token Budgets & L2 Operational Runbooks (`/api/v1/telemetry/*`)
 """
 
-from contextlib import asynccontextmanager
 import json
 import os
 import time
-from typing import Any, Dict, Iterator, Optional
+from collections.abc import Iterator
+from contextlib import asynccontextmanager
+from typing import Annotated, Any
+
 from fastapi import Depends, FastAPI, HTTPException
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 
 from src.dashboard_html import DASHBOARD_HTML
-from src.security import (
-    AuthenticatedPrincipal,
-    create_jwt_token,
-    enforce_rate_limit,
-    is_dev_mode,
-    is_role_authorized,
-    validate_security_config,
-)
-from src.storage import SQLiteStateStore
 from src.models import (
     AuthorizationRequest,
     AuthTokenRequest,
@@ -60,6 +53,18 @@ from src.router import (
     SnowflakeCortexConnector,
     ValueStreamManagementConnector,
 )
+from src.security import (
+    AuthenticatedPrincipal,
+    create_jwt_token,
+    enforce_rate_limit,
+    is_dev_mode,
+    is_role_authorized,
+    validate_security_config,
+)
+from src.storage import SQLiteStateStore
+
+RateLimitedPrincipal = Annotated[AuthenticatedPrincipal, Depends(enforce_rate_limit)]
+
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
@@ -141,7 +146,7 @@ def serve_dashboard() -> HTMLResponse:
 
 
 @app.get("/health")
-def health_check() -> Dict[str, Any]:
+def health_check() -> dict[str, Any]:
     """Returns service health, registered tool count, storage backend, and governance status."""
     storage_backend = "sqlite_wal" if isinstance(mcp_router.storage, SQLiteStateStore) else "in_memory_bounded"
     return {
@@ -163,8 +168,8 @@ def health_check() -> Dict[str, Any]:
 @app.post("/mcp/jsonrpc")
 def mcp_jsonrpc_endpoint(
     req: MCPJsonRpcRequest,
-    principal: AuthenticatedPrincipal = Depends(enforce_rate_limit),
-) -> Dict[str, Any]:
+    principal: RateLimitedPrincipal,
+) -> dict[str, Any]:
     """Standard Model Context Protocol (MCP) JSON-RPC 2.0 endpoint."""
     return fastmcp_server.handle_jsonrpc(req.model_dump(), principal=principal)
 
@@ -172,8 +177,8 @@ def mcp_jsonrpc_endpoint(
 @app.post("/mcp/messages")
 def mcp_messages_endpoint(
     req: MCPJsonRpcRequest,
-    principal: AuthenticatedPrincipal = Depends(enforce_rate_limit),
-) -> Dict[str, Any]:
+    principal: RateLimitedPrincipal,
+) -> dict[str, Any]:
     """MCP HTTP+SSE message dispatch endpoint."""
     return fastmcp_server.handle_jsonrpc(req.model_dump(), principal=principal)
 
@@ -198,8 +203,8 @@ def mcp_sse_endpoint() -> StreamingResponse:
 @app.post("/api/v1/auth/token")
 def issue_session_jwt(
     req: AuthTokenRequest,
-    principal: AuthenticatedPrincipal = Depends(enforce_rate_limit),
-) -> Dict[str, Any]:
+    principal: RateLimitedPrincipal,
+) -> dict[str, Any]:
     """
     Mints a short-lived HS256 JWT bearer token strictly in dev mode (ROUTER_DEV_MODE=1).
     Disabled by default and capped to the platform_operators group (cannot mint super_admin or hitl_approvers).
@@ -225,8 +230,8 @@ def issue_session_jwt(
 @app.post("/api/v1/router/search")
 def semantic_route_tools(
     req: SemanticRouteRequest,
-    principal: AuthenticatedPrincipal = Depends(enforce_rate_limit),
-) -> Dict[str, Any]:
+    principal: RateLimitedPrincipal,
+) -> dict[str, Any]:
     """Routes natural language intent to top-k role-authorized MCP tools via tuned BM25 + dense RRF scoring."""
     res = mcp_router.route_by_query(
         query=req.query,
@@ -250,8 +255,8 @@ def semantic_route_tools(
 @app.post("/api/v1/router/feedback")
 def record_routing_feedback(
     req: RoutingFeedbackRequest,
-    principal: AuthenticatedPrincipal = Depends(enforce_rate_limit),
-) -> Dict[str, Any]:
+    principal: RateLimitedPrincipal,
+) -> dict[str, Any]:
     """Records whether an LLM actually selected one of the routed top-k tools, queuing misses for eval."""
     return mcp_router.record_tool_selection_feedback(
         query=req.query,
@@ -262,8 +267,8 @@ def record_routing_feedback(
 
 @app.get("/api/v1/router/misses")
 def get_routing_misses(
-    principal: AuthenticatedPrincipal = Depends(enforce_rate_limit),
-) -> Dict[str, Any]:
+    principal: RateLimitedPrincipal,
+) -> dict[str, Any]:
     """Returns captured routing misses queued for the continuous evaluation dataset."""
     return {
         "stats": dict(mcp_router.routing_feedback_stats),
@@ -274,8 +279,8 @@ def get_routing_misses(
 @app.post("/api/v1/governance/authorize")
 def authorize_tool_call(
     req: AuthorizationRequest,
-    principal: AuthenticatedPrincipal = Depends(enforce_rate_limit),
-) -> Dict[str, Any]:
+    principal: RateLimitedPrincipal,
+) -> dict[str, Any]:
     """
     Evaluates deterministic JWT/API-key RBAC and server-side HITL ticket + argument-hash approval gates.
     Client-supplied user_roles and hitl_approved are not accepted.
@@ -293,8 +298,8 @@ def authorize_tool_call(
 @app.post("/api/v1/governance/validate-schema")
 def validate_tool_schema(
     req: SchemaValidationRequest,
-    principal: AuthenticatedPrincipal = Depends(enforce_rate_limit),
-) -> Dict[str, Any]:
+    principal: RateLimitedPrincipal,
+) -> dict[str, Any]:
     """Validates tool arguments against the tool's registered JSON Schema Draft-07 contract."""
     return mcp_router.validate_tool_arguments(
         tool_name=req.tool_name,
@@ -304,8 +309,8 @@ def validate_tool_schema(
 
 @app.get("/api/v1/governance/hitl")
 def list_hitl_tickets(
-    principal: AuthenticatedPrincipal = Depends(enforce_rate_limit),
-) -> Dict[str, Any]:
+    principal: RateLimitedPrincipal,
+) -> dict[str, Any]:
     """Lists all Human-in-the-Loop (HITL) approval interrupt tickets from durable storage."""
     tickets = mcp_router.storage.list_tickets()
     return {"total": len(tickets), "tickets": tickets}
@@ -313,8 +318,8 @@ def list_hitl_tickets(
 
 @app.get("/api/v1/governance/audit-verify")
 def verify_audit_hash_chain(
-    principal: AuthenticatedPrincipal = Depends(enforce_rate_limit),
-) -> Dict[str, Any]:
+    principal: RateLimitedPrincipal,
+) -> dict[str, Any]:
     """Verifies SHA-256 hash-chain tamper integrity across persisted append-only audit events."""
     chain = mcp_router.storage.verify_audit_chain()
     return {
@@ -327,7 +332,7 @@ def verify_audit_hash_chain(
 @app.post("/api/v1/governance/hitl/create")
 def create_hitl_ticket(
     req: HITLCreateRequest,
-    principal: AuthenticatedPrincipal = Depends(enforce_rate_limit),
+    principal: RateLimitedPrincipal,
 ) -> Any:
     """Creates a new Human-in-the-Loop (HITL) approval interrupt ticket bound to verified principal & arg hash."""
     if not principal.is_authenticated:
@@ -359,7 +364,7 @@ def create_hitl_ticket(
 @app.post("/api/v1/governance/hitl/resolve")
 def resolve_hitl_ticket(
     req: HITLResolutionRequest,
-    principal: AuthenticatedPrincipal = Depends(enforce_rate_limit),
+    principal: RateLimitedPrincipal,
 ) -> Any:
     """Approves or rejects a pending Human-in-the-Loop (HITL) interrupt ticket via verified reviewer identity."""
     if not principal.is_authenticated:
@@ -387,9 +392,9 @@ def resolve_hitl_ticket(
 
 @app.get("/api/v1/vsm/overview")
 def get_vsm_overview(
-    portfolio_id: Optional[str] = None,
-    principal: AuthenticatedPrincipal = Depends(enforce_rate_limit),
-) -> Dict[str, Any]:
+    principal: RateLimitedPrincipal,
+    portfolio_id: str | None = None,
+) -> dict[str, Any]:
     """Returns connected product portfolios, OKRs, and engineering work tickets."""
     return vsm_connector.get_overview(portfolio_id=portfolio_id)
 
@@ -397,8 +402,8 @@ def get_vsm_overview(
 @app.post("/api/v1/vsm/query")
 def query_vsm_relational(
     req: VSMSqlQueryRequest,
-    principal: AuthenticatedPrincipal = Depends(enforce_rate_limit),
-) -> Dict[str, Any]:
+    principal: RateLimitedPrincipal,
+) -> dict[str, Any]:
     """Executes read-only relational SQL queries across product portfolios, OKRs, and tickets."""
     return vsm_connector.query_vsm_sql(sql=req.sql, role=req.role, params=req.params)
 
@@ -406,8 +411,8 @@ def query_vsm_relational(
 @app.post("/api/v1/vsm/analyze-concerns")
 def analyze_vsm_concerns(
     req: VSMConcernRequest,
-    principal: AuthenticatedPrincipal = Depends(enforce_rate_limit),
-) -> Dict[str, Any]:
+    principal: RateLimitedPrincipal,
+) -> dict[str, Any]:
     """Detects management concerns across OKRs, portfolios & tickets and recommends governed MCP actions."""
     t0 = time.perf_counter()
     res = vsm_connector.analyze_management_concerns(
@@ -432,8 +437,8 @@ def analyze_vsm_concerns(
 @app.post("/api/v1/connectors/snowflake/validate-sql")
 def validate_snowflake_sql(
     req: SnowflakeSQLValidationRequest,
-    principal: AuthenticatedPrincipal = Depends(enforce_rate_limit),
-) -> Dict[str, Any]:
+    principal: RateLimitedPrincipal,
+) -> dict[str, Any]:
     """Validates read-only Snowflake SQL against RBAC, schema/table allow-lists, and AST checks."""
     return snowflake_connector.validate_readonly_sql(
         sql=req.sql,
@@ -445,8 +450,8 @@ def validate_snowflake_sql(
 @app.post("/api/v1/connectors/snowflake/cortex-search")
 def query_snowflake_cortex(
     req: SnowflakeCortexQueryRequest,
-    principal: AuthenticatedPrincipal = Depends(enforce_rate_limit),
-) -> Dict[str, Any]:
+    principal: RateLimitedPrincipal,
+) -> dict[str, Any]:
     """Executes governed Snowflake Cortex Search retrieval over enterprise compliance docs."""
     return snowflake_connector.retrieve_cortex_rag(
         query=req.query,
@@ -458,8 +463,8 @@ def query_snowflake_cortex(
 @app.post("/api/v1/connectors/informatica/validate")
 def validate_informatica_taskflow(
     req: IICSTaskflowWebhookPayload,
-    principal: AuthenticatedPrincipal = Depends(enforce_rate_limit),
-) -> Dict[str, Any]:
+    principal: RateLimitedPrincipal,
+) -> dict[str, Any]:
     """Validates Informatica Cloud (IICS) ELT taskflow SLA and row counts prior to RAG indexing."""
     return informatica_adapter.validate_taskflow_run(req.model_dump())
 
@@ -467,8 +472,8 @@ def validate_informatica_taskflow(
 @app.post("/api/v1/connectors/postgres/query")
 def query_postgres_ledger(
     req: PostgresQueryRequest,
-    principal: AuthenticatedPrincipal = Depends(enforce_rate_limit),
-) -> Dict[str, Any]:
+    principal: RateLimitedPrincipal,
+) -> dict[str, Any]:
     """Executes read-only parameterized SQL query against the relational ledger."""
     return postgres_connector.query_ledger(sql=req.sql, role=req.role, params=req.params)
 
@@ -476,8 +481,8 @@ def query_postgres_ledger(
 @app.post("/api/v1/connectors/postgres/snapshot/create")
 def create_postgres_snapshot(
     req: PostgresSnapshotRequest,
-    principal: AuthenticatedPrincipal = Depends(enforce_rate_limit),
-) -> Dict[str, Any]:
+    principal: RateLimitedPrincipal,
+) -> dict[str, Any]:
     """Creates a point-in-time state snapshot of the relational ledger."""
     return postgres_connector.create_snapshot(req.snapshot_name)
 
@@ -485,8 +490,8 @@ def create_postgres_snapshot(
 @app.post("/api/v1/connectors/postgres/snapshot/restore")
 def restore_postgres_snapshot(
     req: PostgresSnapshotRequest,
-    principal: AuthenticatedPrincipal = Depends(enforce_rate_limit),
-) -> Dict[str, Any]:
+    principal: RateLimitedPrincipal,
+) -> dict[str, Any]:
     """Restores the relational ledger to a verified point-in-time snapshot."""
     if not principal.is_authenticated or not is_role_authorized("platform_admin", principal.roles):
         raise HTTPException(status_code=403, detail="platform_admin_role_required_for_snapshot_restore")
@@ -495,8 +500,8 @@ def restore_postgres_snapshot(
 
 @app.get("/api/v1/router/benchmark")
 def get_router_benchmark(
-    principal: AuthenticatedPrincipal = Depends(enforce_rate_limit),
-) -> Dict[str, Any]:
+    principal: RateLimitedPrincipal,
+) -> dict[str, Any]:
     """Returns cached train & held-out Recall@k and ablation measurements over serialized schemas."""
     cached = getattr(app.state, "benchmark_cache", None)
     if cached is None:
@@ -510,12 +515,12 @@ def get_router_benchmark(
 @app.post("/api/v1/adapters/bedrock/invoke")
 def invoke_bedrock_structured(
     req: BedrockStructuredInvokeRequest,
-    principal: AuthenticatedPrincipal = Depends(enforce_rate_limit),
-) -> Dict[str, Any]:
+    principal: RateLimitedPrincipal,
+) -> dict[str, Any]:
     """Invokes Amazon Bedrock / AgentCore with deterministic structured output verification and retry."""
     state = {"calls": 0}
 
-    def simulated_bedrock_provider() -> Dict[str, Any]:
+    def simulated_bedrock_provider() -> dict[str, Any]:
         state["calls"] += 1
         if req.simulate_flaky_first_attempt and state["calls"] == 1:
             return {
@@ -546,8 +551,8 @@ def invoke_bedrock_structured(
 @app.get("/api/v1/adapters/bridges/{framework}")
 def get_framework_bridge(
     framework: str,
-    principal: AuthenticatedPrincipal = Depends(enforce_rate_limit),
-) -> Dict[str, Any]:
+    principal: RateLimitedPrincipal,
+) -> dict[str, Any]:
     """Exports top routed MCP tools into LangGraph, smolagents, or CrewAI schemas."""
     sample_tools = mcp_router.route_by_query(
         "Value Stream OKR management concerns, Snowflake Cortex Search, and PostgreSQL ledger", k=4
@@ -567,8 +572,8 @@ def get_framework_bridge(
 
 @app.get("/api/v1/telemetry/summary")
 def get_telemetry_summary(
-    principal: AuthenticatedPrincipal = Depends(enforce_rate_limit),
-) -> Dict[str, Any]:
+    principal: RateLimitedPrincipal,
+) -> dict[str, Any]:
     """Returns aggregated OpenTelemetry trace metrics, latency percentiles, and token budgets."""
     return telemetry_monitor.get_summary_metrics()
 
@@ -576,8 +581,8 @@ def get_telemetry_summary(
 @app.post("/api/v1/telemetry/span")
 def record_telemetry_span(
     req: TelemetrySpanRequest,
-    principal: AuthenticatedPrincipal = Depends(enforce_rate_limit),
-) -> Dict[str, Any]:
+    principal: RateLimitedPrincipal,
+) -> dict[str, Any]:
     """Records an OpenTelemetry execution span and evaluates token budget thresholds."""
     span = telemetry_monitor.record_span(
         span_name=req.span_name,
@@ -594,8 +599,8 @@ def record_telemetry_span(
 @app.post("/api/v1/telemetry/runbook")
 def lookup_operational_runbook(
     req: RunbookLookupRequest,
-    principal: AuthenticatedPrincipal = Depends(enforce_rate_limit),
-) -> Dict[str, str]:
+    principal: RateLimitedPrincipal,
+) -> dict[str, str]:
     """Generates an operational runbook procedure for incident triage."""
     return telemetry_monitor.generate_runbook_entry(
         incident_type=req.incident_type,

@@ -13,17 +13,18 @@ import re
 import sqlite3
 import threading
 import time
-from typing import Any, Callable, Dict, List, Optional, Sequence, Set
+from collections.abc import Callable, Sequence
+from typing import Any, ClassVar
 
 from src.connectors.sql_guard import SafeSQLValidator
 
 
 def _sqlite_readonly_authorizer(
     action: int,
-    arg1: Optional[str],
-    arg2: Optional[str],
-    db_name: Optional[str],
-    trigger: Optional[str],
+    arg1: str | None,
+    arg2: str | None,
+    db_name: str | None,
+    trigger: str | None,
 ) -> int:
     """SQLite authorizer callback permitting strictly read-only SELECT execution."""
     allowed_actions = {
@@ -41,8 +42,8 @@ def _execute_readonly_sqlite(
     conn: sqlite3.Connection,
     lock: threading.Lock,
     sql: str,
-    params: Optional[Sequence[Any]] = None,
-) -> List[Dict[str, Any]]:
+    params: Sequence[Any] | None = None,
+) -> list[dict[str, Any]]:
     """Executes a parameterized read-only SQL query guarded by sqlite3.set_authorizer."""
     with lock:
         conn.set_authorizer(_sqlite_readonly_authorizer)
@@ -61,7 +62,7 @@ class SnowflakeCortexConnector:
     In live Snowflake deployments, pair with a dedicated read-only Snowflake role and warehouse session.
     """
 
-    DEFAULT_ALLOWED_TABLES: Set[str] = {
+    DEFAULT_ALLOWED_TABLES: ClassVar[set[str]] = {
         "PORTFOLIO_GOLD.FUNDS",
         "PORTFOLIO_GOLD.HOLDINGS",
         "PORTFOLIO_GOLD.BENCHMARKS",
@@ -70,15 +71,15 @@ class SnowflakeCortexConnector:
 
     def __init__(
         self,
-        allowed_roles: List[str],
-        allowed_schemas: List[str],
-        allowed_tables: Optional[List[str]] = None,
+        allowed_roles: list[str],
+        allowed_schemas: list[str],
+        allowed_tables: list[str] | None = None,
     ):
         self.allowed_roles = set(allowed_roles)
         self.allowed_schemas = set(allowed_schemas)
         self.allowed_tables = set(allowed_tables) if allowed_tables is not None else set(self.DEFAULT_ALLOWED_TABLES)
-        self._knowledge_chunks: List[Dict[str, Any]] = []
-        self._structured_funds: List[Dict[str, Any]] = [
+        self._knowledge_chunks: list[dict[str, Any]] = []
+        self._structured_funds: list[dict[str, Any]] = [
             {"fund_id": "FID-CDN-EQ-01", "name": "Canadian Disciplined Equity Fund", "nav": 48.72, "aum_cad_m": 4120.5, "risk_tier": "MEDIUM", "active": 1},
             {"fund_id": "FID-GLB-IN-02", "name": "Global Innovators Institutional Trust", "nav": 92.15, "aum_cad_m": 8940.0, "risk_tier": "HIGH", "active": 1},
             {"fund_id": "FID-FIX-FI-03", "name": "Canadian Short-Term Bond & RRSP Core", "nav": 10.44, "aum_cad_m": 6310.2, "risk_tier": "LOW", "active": 1},
@@ -117,12 +118,12 @@ class SnowflakeCortexConnector:
             ]
         )
 
-    def index_chunks(self, chunks: List[Dict[str, Any]]) -> int:
+    def index_chunks(self, chunks: list[dict[str, Any]]) -> int:
         """Loads validated document chunks and metadata from Snowflake staging tables."""
         self._knowledge_chunks.extend(chunks)
         return len(self._knowledge_chunks)
 
-    def validate_readonly_sql(self, sql: str, role: str, schema: str) -> Dict[str, Any]:
+    def validate_readonly_sql(self, sql: str, role: str, schema: str) -> dict[str, Any]:
         """Validates that an agent-generated Snowflake query obeys read-only RBAC and table/schema allow-lists."""
         res = SafeSQLValidator.validate_readonly_sql(
             sql=sql,
@@ -142,7 +143,7 @@ class SnowflakeCortexConnector:
 
     def retrieve_cortex_rag(
         self, query: str, role: str, top_k: int = 3
-    ) -> Dict[str, Any]:
+    ) -> dict[str, Any]:
         """Executes governed Snowflake Cortex Search hybrid retrieval over enterprise documents."""
         if role not in self.allowed_roles:
             return {"status": "error", "reason": "snowflake_rbac_role_denied", "results": []}
@@ -175,10 +176,10 @@ class InformaticaCloudTaskflowAdapter:
     def __init__(self, min_rows_threshold: int = 1, max_lag_minutes: int = 60):
         self.min_rows_threshold = min_rows_threshold
         self.max_lag_minutes = max_lag_minutes
-        self.validation_history: List[Dict[str, Any]] = []
+        self.validation_history: list[dict[str, Any]] = []
         self.rag_sync_locked: bool = False
 
-    def validate_taskflow_run(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+    def validate_taskflow_run(self, payload: dict[str, Any]) -> dict[str, Any]:
         """Validates an Informatica Cloud (IICS) ELT job webhook payload before RAG sync."""
         taskflow_name = payload.get("taskflow_name", "unknown_taskflow")
         status = str(payload.get("status", "UNKNOWN")).upper()
@@ -252,7 +253,7 @@ class PostgresEnterpriseConnector:
         self._lock = threading.Lock()
         self._conn = sqlite3.connect(db_path, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
-        self._snapshots: Dict[str, Dict[str, Any]] = {}
+        self._snapshots: dict[str, dict[str, Any]] = {}
         self._init_schema_and_seed()
 
     def _init_schema_and_seed(self) -> None:
@@ -303,7 +304,7 @@ class PostgresEnterpriseConnector:
         }
 
     @property
-    def _accounts(self) -> List[Dict[str, Any]]:
+    def _accounts(self) -> list[dict[str, Any]]:
         return _execute_readonly_sqlite(
             self._conn,
             self._lock,
@@ -311,14 +312,14 @@ class PostgresEnterpriseConnector:
         )
 
     @property
-    def _audit_log(self) -> List[Dict[str, Any]]:
+    def _audit_log(self) -> list[dict[str, Any]]:
         return _execute_readonly_sqlite(
             self._conn,
             self._lock,
             "SELECT event_id, action, actor, detail, created_at FROM audit_log ORDER BY event_id",
         )
 
-    ALLOWED_ROLES: Set[str] = {
+    ALLOWED_ROLES: ClassVar[set[str]] = {
         "analyst",
         "compliance_officer",
         "data_engineer",
@@ -333,8 +334,8 @@ class PostgresEnterpriseConnector:
         self,
         sql: str,
         role: str = "analyst",
-        params: Optional[List[Any]] = None,
-    ) -> Dict[str, Any]:
+        params: list[Any] | None = None,
+    ) -> dict[str, Any]:
         if role not in self.ALLOWED_ROLES:
             return {"status": "error", "reason": "postgres_rbac_role_denied", "rows": []}
 
@@ -372,7 +373,7 @@ class PostgresEnterpriseConnector:
 
     def execute_wire_transfer(
         self, from_account: str, to_account: str, amount_usd: float, hitl_approved: bool = False
-    ) -> Dict[str, Any]:
+    ) -> dict[str, Any]:
         if not hitl_approved:
             return {"status": "blocked", "reason": "hitl_approval_required_for_postgres_mutation"}
         if amount_usd <= 0:
@@ -431,7 +432,7 @@ class PostgresEnterpriseConnector:
             "audit_events_count": audit_count,
         }
 
-    def create_snapshot(self, snapshot_name: str) -> Dict[str, Any]:
+    def create_snapshot(self, snapshot_name: str) -> dict[str, Any]:
         accounts_snap = self._accounts
         audit_snap = self._audit_log
         self._snapshots[snapshot_name] = {
@@ -446,7 +447,7 @@ class PostgresEnterpriseConnector:
             "available_snapshots": list(self._snapshots.keys()),
         }
 
-    def restore_snapshot(self, snapshot_name: str, actor: str = "platform_admin") -> Dict[str, Any]:
+    def restore_snapshot(self, snapshot_name: str, actor: str = "platform_admin") -> dict[str, Any]:
         snap = self._snapshots.get(snapshot_name)
         if not snap:
             return {
@@ -599,7 +600,7 @@ class ValueStreamManagementConnector:
                     tickets,
                 )
 
-    def get_overview(self, portfolio_id: Optional[str] = None) -> Dict[str, Any]:
+    def get_overview(self, portfolio_id: str | None = None) -> dict[str, Any]:
         """Returns connected product portfolios, OKRs, engineering tickets, and summary KPIs."""
         if portfolio_id:
             p_rows = _execute_readonly_sqlite(
@@ -636,8 +637,8 @@ class ValueStreamManagementConnector:
         self,
         sql: str,
         role: str = "analyst",
-        params: Optional[List[Any]] = None,
-    ) -> Dict[str, Any]:
+        params: list[Any] | None = None,
+    ) -> dict[str, Any]:
         """Executes an AST-validated, read-only SQL query across connected VSM tables."""
         validation = SafeSQLValidator.validate_readonly_sql(
             sql=sql,
@@ -672,10 +673,10 @@ class ValueStreamManagementConnector:
     def analyze_management_concerns(
         self,
         query: str = "Identify management concerns across OKRs, product portfolios, and blocked engineering tickets and suggest actions",
-        portfolio_id: Optional[str] = None,
-        router: Optional[Any] = None,
-        bedrock_adapter: Optional[Any] = None,
-    ) -> Dict[str, Any]:
+        portfolio_id: str | None = None,
+        router: Any | None = None,
+        bedrock_adapter: Any | None = None,
+    ) -> dict[str, Any]:
         """
         Detects management concerns by joining portfolios, OKRs, and engineering tickets in SQL,
         routes relevant MCP governance tools, and validates structured action recommendations.
@@ -703,7 +704,7 @@ class ValueStreamManagementConnector:
             JOIN objectives_okrs o ON p.portfolio_id = o.portfolio_id
             LEFT JOIN engineering_tickets t ON o.okr_id = t.okr_id
         """
-        params: List[Any] = []
+        params: list[Any] = []
         if portfolio_id:
             join_sql += " WHERE p.portfolio_id = ?"
             params.append(portfolio_id)
@@ -711,7 +712,7 @@ class ValueStreamManagementConnector:
 
         joined_rows = _execute_readonly_sqlite(self._conn, self._lock, join_sql, params=params)
 
-        concerns: List[Dict[str, Any]] = []
+        concerns: list[dict[str, Any]] = []
         seen_keys = set()
         for row in joined_rows:
             okr_id = row["okr_id"]
@@ -768,8 +769,8 @@ class ValueStreamManagementConnector:
                     }
                 )
 
-        routed_tools: List[Dict[str, Any]] = []
-        routing_metrics: Dict[str, Any] = {}
+        routed_tools: list[dict[str, Any]] = []
+        routing_metrics: dict[str, Any] = {}
         if router is not None:
             route_res = router.route_by_query(query, k=4)
             routed_tools = route_res["routed_tools"]
@@ -799,9 +800,9 @@ class ValueStreamManagementConnector:
             f"(highest severity: {risk_tier}). Recommended {len(recommended_actions)} governed MCP action(s) with HITL gating."
         )
 
-        bedrock_result: Optional[Dict[str, Any]] = None
+        bedrock_result: dict[str, Any] | None = None
         if bedrock_adapter is not None:
-            def _synthesize() -> Dict[str, Any]:
+            def _synthesize() -> dict[str, Any]:
                 return {
                     "output": {
                         "executive_summary": executive_summary,
@@ -848,8 +849,8 @@ class EnterpriseRESTConnector:
         self,
         service_name: str,
         endpoint: str,
-        provider_fn: Optional[Callable[[], Dict[str, Any]]] = None,
-    ) -> Dict[str, Any]:
+        provider_fn: Callable[[], dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
         if self.circuit_state == "OPEN":
             return {
                 "status": "circuit_open",

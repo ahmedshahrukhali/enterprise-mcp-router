@@ -12,9 +12,10 @@ from __future__ import annotations
 
 import json
 import math
-from pathlib import Path
 import sys
-from typing import Dict, List, Optional, Sequence
+from collections.abc import Sequence
+from pathlib import Path
+from typing import Any
 
 BGE_MODEL_ID = "BAAI/bge-small-en-v1.5"
 BGE_DIMENSION = 384
@@ -35,7 +36,7 @@ def cosine_similarity(vec_a: Sequence[float], vec_b: Sequence[float]) -> float:
     return max(0.0, min(1.0, float(dot)))
 
 
-def _l2_normalize(vec: Sequence[float]) -> List[float]:
+def _l2_normalize(vec: Sequence[float]) -> list[float]:
     norm = math.sqrt(sum(v * v for v in vec)) or 1.0
     return [round(float(v) / norm, 5) for v in vec]
 
@@ -43,13 +44,14 @@ def _l2_normalize(vec: Sequence[float]) -> List[float]:
 class BGEEmbeddingProvider:
     """Lazy loader and precomputed cache reader for BAAI/bge-small-en-v1.5 embeddings."""
 
-    def __init__(self, cache_path: Optional[Path] = None):
+    def __init__(self, cache_path: Path | None = None):
         self.cache_path = cache_path or DEFAULT_CACHE_PATH
-        self._tool_vectors: Dict[str, List[float]] = {}
-        self._query_vectors: Dict[str, List[float]] = {}
+        self._tool_vectors: dict[str, list[float]] = {}
+        self._query_vectors: dict[str, list[float]] = {}
         self._cache_loaded = False
-        self._tokenizer = None
-        self._model = None
+        self._tokenizer: Any = None
+        self._model: Any = None
+        self._torch: Any = None
         self._model_load_failed = False
 
     def _ensure_cache_loaded(self) -> None:
@@ -62,7 +64,7 @@ class BGEEmbeddingProvider:
             payload = json.loads(self.cache_path.read_text(encoding="utf-8"))
             self._tool_vectors = payload.get("tools", {})
             self._query_vectors = payload.get("queries", {})
-        except Exception:
+        except (OSError, json.JSONDecodeError, ValueError, TypeError):
             self._tool_vectors = {}
             self._query_vectors = {}
 
@@ -80,17 +82,17 @@ class BGEEmbeddingProvider:
             try:
                 self._tokenizer = AutoTokenizer.from_pretrained(BGE_MODEL_ID, local_files_only=True)
                 self._model = AutoModel.from_pretrained(BGE_MODEL_ID, local_files_only=True)
-            except Exception:
+            except (OSError, ValueError, RuntimeError):
                 self._tokenizer = AutoTokenizer.from_pretrained(BGE_MODEL_ID)
                 self._model = AutoModel.from_pretrained(BGE_MODEL_ID)
             self._model.eval()
             self._torch = torch
             return True
-        except Exception:
+        except (ImportError, OSError, RuntimeError, ValueError):
             self._model_load_failed = True
             return False
 
-    def encode_live_texts(self, texts: Sequence[str], is_query: bool = False) -> Optional[List[List[float]]]:
+    def encode_live_texts(self, texts: Sequence[str], is_query: bool = False) -> list[list[float]] | None:
         """Encodes arbitrary strings into L2-normalized 384-dim CLS vectors via BAAI/bge-small-en-v1.5."""
         if not texts or not self._ensure_live_model():
             return None
@@ -112,7 +114,7 @@ class BGEEmbeddingProvider:
             normalized = torch.nn.functional.normalize(cls_emb, p=2, dim=-1)
             return [[round(float(x), 5) for x in row] for row in normalized.cpu().tolist()]
 
-    def embed_tool(self, name: str, domain: str, description: str) -> Optional[List[float]]:
+    def embed_tool(self, name: str, domain: str, description: str) -> list[float] | None:
         """Returns 384-dim BGE embedding for a tool from cache or live encoder."""
         self._ensure_cache_loaded()
         cached = self._tool_vectors.get(name)
@@ -124,7 +126,7 @@ class BGEEmbeddingProvider:
             return vecs[0]
         return None
 
-    def embed_query(self, query: str) -> Optional[List[float]]:
+    def embed_query(self, query: str) -> list[float] | None:
         """Returns 384-dim BGE embedding for a query from cache or live encoder."""
         self._ensure_cache_loaded()
         cached = self._query_vectors.get(query)
@@ -143,10 +145,10 @@ class BGEEmbeddingProvider:
 
     def build_and_save_cache(
         self,
-        tool_entries: Sequence[Dict[str, str]],
+        tool_entries: Sequence[dict[str, str]],
         queries: Sequence[str],
-        output_path: Optional[Path] = None,
-    ) -> Dict[str, object]:
+        output_path: Path | None = None,
+    ) -> dict[str, object]:
         """Encodes all tool documents and evaluation queries live and writes compact JSON cache."""
         target = output_path or self.cache_path
         tool_texts = [format_tool_document(t["name"], t["domain"], t["description"]) for t in tool_entries]

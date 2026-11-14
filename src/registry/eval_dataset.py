@@ -13,8 +13,9 @@ Addresses held-out evaluation and real vs hashed bi-encoder comparison:
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Dict, List, Sequence, Tuple
+from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from src.router import EnterpriseMCPRouter
@@ -26,9 +27,9 @@ class EvalQueryCase:
 
     query_id: str
     category: str  # "single_domain" or "cross_domain"
-    domains: Tuple[str, ...]
+    domains: tuple[str, ...]
     query: str
-    expected_tools: Tuple[str, ...]
+    expected_tools: tuple[str, ...]
     split: str = "train"  # "train" (60%) or "heldout_test" (40%+ incl. paraphrased)
     style: str = "standard"  # "standard" or "paraphrased_adversarial"
 
@@ -37,7 +38,7 @@ class EvalQueryCase:
 # 120 Single-Domain Queries (15 per domain x 8 enterprise namespaces)
 # ---------------------------------------------------------------------------
 
-SINGLE_DOMAIN_EVAL_CASES: List[EvalQueryCase] = [
+SINGLE_DOMAIN_EVAL_CASES: list[EvalQueryCase] = [
     # --- 1. snowflake (15) ---
     EvalQueryCase("sf-01", "single_domain", ("snowflake",), "Search RRSP compliance guidelines and mutual fund documents in Cortex RAG", ("snowflake.cortex_search_docs",)),
     EvalQueryCase("sf-02", "single_domain", ("snowflake",), "Run a guarded read-only SELECT SQL query against PORTFOLIO_GOLD warehouse tables", ("snowflake.execute_readonly_sql",)),
@@ -180,7 +181,7 @@ SINGLE_DOMAIN_EVAL_CASES: List[EvalQueryCase] = [
 # 40 Cross-Domain Evaluation Queries (spanning 2+ domains / expected tools)
 # ---------------------------------------------------------------------------
 
-CROSS_DOMAIN_EVAL_CASES: List[EvalQueryCase] = [
+CROSS_DOMAIN_EVAL_CASES: list[EvalQueryCase] = [
     EvalQueryCase(
         "xd-01", "cross_domain", ("informatica", "snowflake"),
         "Validate Informatica taskflow SLA row counts and refresh Snowflake Cortex vector search index",
@@ -384,10 +385,10 @@ CROSS_DOMAIN_EVAL_CASES: List[EvalQueryCase] = [
 ]
 
 
-def _assign_stratified_splits(cases: List[EvalQueryCase]) -> List[EvalQueryCase]:
+def _assign_stratified_splits(cases: list[EvalQueryCase]) -> list[EvalQueryCase]:
     """Deterministically assigns 60% train / 40% held-out splits stratified within each domain/category."""
-    per_group_idx: Dict[str, int] = {}
-    out: List[EvalQueryCase] = []
+    per_group_idx: dict[str, int] = {}
+    out: list[EvalQueryCase] = []
     for c in cases:
         group_key = c.domains[0] if c.category == "single_domain" else "cross_domain"
         idx = per_group_idx.get(group_key, 0)
@@ -414,7 +415,7 @@ CROSS_DOMAIN_EVAL_CASES = _assign_stratified_splits(CROSS_DOMAIN_EVAL_CASES)
 # 40 Paraphrased / Adversarial Held-Out Queries (minimal keyword overlap)
 # ---------------------------------------------------------------------------
 
-PARAPHRASED_ADVERSARIAL_EVAL_CASES: List[EvalQueryCase] = [
+PARAPHRASED_ADVERSARIAL_EVAL_CASES: list[EvalQueryCase] = [
     # snowflake (4)
     EvalQueryCase("para-sf-01", "single_domain", ("snowflake",), "Find policy passages explaining tax-deferred Canadian retirement savings compliance regulations", ("snowflake.cortex_search_docs",), split="heldout_test", style="paraphrased_adversarial"),
     EvalQueryCase("para-sf-02", "single_domain", ("snowflake",), "Pull daily per-share pricing movements over past months for pension investment vehicle POL-101", ("snowflake.get_fund_nav_history",), split="heldout_test", style="paraphrased_adversarial"),
@@ -474,12 +475,12 @@ PARAPHRASED_ADVERSARIAL_EVAL_CASES: List[EvalQueryCase] = [
     EvalQueryCase("para-xd-08", "cross_domain", ("informatica", "knowledge_graph"), "Check whether ingestion freshness interlock is clear before rebuilding dense vector indexes", ("informatica.check_rag_gate_lock", "knowledge_graph.reindex_qdrant_collection"), split="heldout_test", style="paraphrased_adversarial"),
 ]
 
-STANDARD_EVAL_DATASET: List[EvalQueryCase] = SINGLE_DOMAIN_EVAL_CASES + CROSS_DOMAIN_EVAL_CASES
-TRAIN_EVAL_DATASET: List[EvalQueryCase] = [c for c in STANDARD_EVAL_DATASET if c.split == "train"]
-HELDOUT_STANDARD_EVAL_DATASET: List[EvalQueryCase] = [c for c in STANDARD_EVAL_DATASET if c.split == "heldout_test"]
-HELDOUT_PARAPHRASED_EVAL_DATASET: List[EvalQueryCase] = list(PARAPHRASED_ADVERSARIAL_EVAL_CASES)
-HELDOUT_EVAL_DATASET: List[EvalQueryCase] = HELDOUT_STANDARD_EVAL_DATASET + HELDOUT_PARAPHRASED_EVAL_DATASET
-FULL_EVAL_DATASET: List[EvalQueryCase] = STANDARD_EVAL_DATASET + PARAPHRASED_ADVERSARIAL_EVAL_CASES
+STANDARD_EVAL_DATASET: list[EvalQueryCase] = SINGLE_DOMAIN_EVAL_CASES + CROSS_DOMAIN_EVAL_CASES
+TRAIN_EVAL_DATASET: list[EvalQueryCase] = [c for c in STANDARD_EVAL_DATASET if c.split == "train"]
+HELDOUT_STANDARD_EVAL_DATASET: list[EvalQueryCase] = [c for c in STANDARD_EVAL_DATASET if c.split == "heldout_test"]
+HELDOUT_PARAPHRASED_EVAL_DATASET: list[EvalQueryCase] = list(PARAPHRASED_ADVERSARIAL_EVAL_CASES)
+HELDOUT_EVAL_DATASET: list[EvalQueryCase] = HELDOUT_STANDARD_EVAL_DATASET + HELDOUT_PARAPHRASED_EVAL_DATASET
+FULL_EVAL_DATASET: list[EvalQueryCase] = STANDARD_EVAL_DATASET + PARAPHRASED_ADVERSARIAL_EVAL_CASES
 
 
 def evaluate_recall_at_k(
@@ -487,25 +488,27 @@ def evaluate_recall_at_k(
     cases: Sequence[EvalQueryCase] = HELDOUT_EVAL_DATASET,
     k_values: Sequence[int] = (3, 5, 8, 10, 25),
     scoring_mode: str = "hybrid",
-    weights: Tuple[float, float, float] = (0.55, 0.35, 0.10),
+    weights: tuple[float, float, float] = (0.55, 0.35, 0.10),
     auto_widen: bool = False,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """
     Evaluates macro-averaged Recall@k and Hit@k across the specified dataset split,
     reporting overall, single-domain, and cross-domain breakdowns separately.
     """
     max_k = max(k_values)
 
-    def _init_bucket() -> Dict[str, List[float]]:
-        return {f"recall@{k}": [] for k in k_values} | {f"hit@{k}": [] for k in k_values}
+    def _init_bucket() -> dict[str, list[float]]:
+        bucket: dict[str, list[float]] = {f"recall@{k}": [] for k in k_values}
+        bucket.update({f"hit@{k}": [] for k in k_values})
+        return bucket
 
-    buckets: Dict[str, Dict[str, List[float]]] = {
+    buckets: dict[str, dict[str, list[float]]] = {
         "overall": _init_bucket(),
         "single_domain": _init_bucket(),
         "cross_domain": _init_bucket(),
     }
-    latencies: List[float] = []
-    token_reductions: List[float] = []
+    latencies: list[float] = []
+    token_reductions: list[float] = []
     widened_count = 0
 
     for case in cases:
@@ -544,8 +547,8 @@ def evaluate_recall_at_k(
                 buckets[split_key][f"recall@{k}"].append(recall)
                 buckets[split_key][f"hit@{k}"].append(hit)
 
-    def _summarize(bucket: Dict[str, List[float]], count: int) -> Dict[str, Any]:
-        summary: Dict[str, Any] = {"query_count": count}
+    def _summarize(bucket: dict[str, list[float]], count: int) -> dict[str, Any]:
+        summary: dict[str, Any] = {"query_count": count}
         for k in k_values:
             r_vals = bucket[f"recall@{k}"]
             h_vals = bucket[f"hit@{k}"]
@@ -568,13 +571,13 @@ def evaluate_recall_at_k(
     }
 
 
-def run_full_routing_benchmark(router: EnterpriseMCPRouter) -> Dict[str, Any]:
+def run_full_routing_benchmark(router: EnterpriseMCPRouter) -> dict[str, Any]:
     """
     Runs honest routing ablations across train (96), held-out standard (64),
     held-out paraphrased/adversarial (40), and combined held-out test (104),
     comparing 64-dim feature-hashing vs Okapi BM25 vs BAAI/bge-small-en-v1.5 (384-dim).
     """
-    ablation_configs: List[Tuple[str, str, Tuple[float, float, float], bool]] = [
+    ablation_configs: list[tuple[str, str, tuple[float, float, float], bool]] = [
         ("dense_only_hash64", "dense_only", (1.0, 0.0, 0.0), False),
         ("bm25_only", "bm25_only", (0.0, 1.0, 0.0), False),
         ("hybrid_hash64_default_55_35_10", "hybrid", (0.55, 0.35, 0.10), False),
@@ -584,7 +587,7 @@ def run_full_routing_benchmark(router: EnterpriseMCPRouter) -> Dict[str, Any]:
         ("hybrid_bge_widen_k5_fallback", "hybrid_bge_bm25", (0.45, 0.45, 0.10), True),
     ]
 
-    split_datasets: Dict[str, Sequence[EvalQueryCase]] = {
+    split_datasets: dict[str, Sequence[EvalQueryCase]] = {
         "train_96": TRAIN_EVAL_DATASET,
         "heldout_standard_64": HELDOUT_STANDARD_EVAL_DATASET,
         "heldout_paraphrased_40": HELDOUT_PARAPHRASED_EVAL_DATASET,
@@ -592,9 +595,9 @@ def run_full_routing_benchmark(router: EnterpriseMCPRouter) -> Dict[str, Any]:
         "all_200": FULL_EVAL_DATASET,
     }
 
-    ablations_by_split: Dict[str, Dict[str, Any]] = {}
+    ablations_by_split: dict[str, dict[str, Any]] = {}
     for split_name, ds in split_datasets.items():
-        split_res: Dict[str, Any] = {}
+        split_res: dict[str, Any] = {}
         for label, mode, w, widen in ablation_configs:
             split_res[label] = evaluate_recall_at_k(
                 router=router,

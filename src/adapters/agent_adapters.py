@@ -5,7 +5,8 @@ Amazon Bedrock / AgentCore Converse API Adapter & Multi-Framework Tool Bridges
 
 import json
 import os
-from typing import Any, Callable, Dict, List, Optional
+from collections.abc import Callable
+from typing import Any
 
 
 class BedrockAgentCoreAdapter:
@@ -25,7 +26,7 @@ class BedrockAgentCoreAdapter:
         self.max_retries = max_retries
         self.region_name = region_name
 
-    def format_converse_tool_config(self, tools: List[Dict[str, Any]]) -> Dict[str, Any]:
+    def format_converse_tool_config(self, tools: list[dict[str, Any]]) -> dict[str, Any]:
         """
         Formats routed MCP tools into an AWS Bedrock Converse API `toolConfig` block.
         """
@@ -54,20 +55,20 @@ class BedrockAgentCoreAdapter:
     def invoke_converse_live_or_sim(
         self,
         prompt: str,
-        required_keys: List[str],
-        tools: Optional[List[Dict[str, Any]]] = None,
-        fallback_fn: Optional[Callable[[], Dict[str, Any]]] = None,
-    ) -> Dict[str, Any]:
+        required_keys: list[str],
+        tools: list[dict[str, Any]] | None = None,
+        fallback_fn: Callable[[], dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
         """
         Uses live AWS Bedrock Runtime `converse()` when `AWS_BEDROCK_LIVE=1` is set
         and boto3 is configured; otherwise invokes the deterministic local provider.
         """
         if os.environ.get("AWS_BEDROCK_LIVE") == "1":
-            def _live_bedrock_call() -> Dict[str, Any]:
+            def _live_bedrock_call() -> dict[str, Any]:
                 import boto3  # type: ignore[import-not-found]
 
                 client = boto3.client("bedrock-runtime", region_name=self.region_name)
-                kwargs: Dict[str, Any] = {
+                kwargs: dict[str, Any] = {
                     "modelId": self.model_id,
                     "messages": [
                         {
@@ -99,7 +100,7 @@ class BedrockAgentCoreAdapter:
             return self.invoke_with_structured_output(required_keys, _live_bedrock_call)
 
         if fallback_fn is None:
-            def _default_sim() -> Dict[str, Any]:
+            def _default_sim() -> dict[str, Any]:
                 return {
                     "output": {k: f"verified_{k}" for k in required_keys},
                     "usage": {"prompt_tokens": 240, "completion_tokens": 90},
@@ -111,17 +112,17 @@ class BedrockAgentCoreAdapter:
 
     def invoke_with_structured_output(
         self,
-        required_keys: List[str],
-        provider_fn: Callable[[], Dict[str, Any]],
-    ) -> Dict[str, Any]:
+        required_keys: list[str],
+        provider_fn: Callable[[], dict[str, Any]],
+    ) -> dict[str, Any]:
         """
         Invokes a Bedrock / AgentCore completion function with retry handling
         and validates that the structured output contains all required schema keys.
         Accumulates token usage across all attempts.
         """
         attempts = 0
-        last_error: Optional[str] = None
-        retry_trace: List[Dict[str, Any]] = []
+        last_error: str | None = None
+        retry_trace: list[dict[str, Any]] = []
         total_prompt_tokens = 0
         total_completion_tokens = 0
 
@@ -194,7 +195,7 @@ class AgentFrameworkBridges:
     """
 
     @staticmethod
-    def to_langgraph_tools(tools: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    def to_langgraph_tools(tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
         return [
             {
                 "framework": "langgraph",
@@ -209,7 +210,7 @@ class AgentFrameworkBridges:
         ]
 
     @staticmethod
-    def to_smolagents_tools(tools: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    def to_smolagents_tools(tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
         out = []
         for t in tools:
             py_fn_name = t["name"].replace(".", "_")
@@ -232,7 +233,7 @@ class AgentFrameworkBridges:
         return out
 
     @staticmethod
-    def to_crewai_tools(tools: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    def to_crewai_tools(tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
         return [
             {
                 "framework": "crewai",

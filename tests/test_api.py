@@ -3,6 +3,7 @@ FastAPI REST, JSON-RPC 2.0 & SSE Integration Tests for Enterprise-MCP-Router.
 """
 
 from fastapi.testclient import TestClient
+
 from src.main import app
 
 client = TestClient(app)

@@ -4,74 +4,74 @@ Supports SQLite (zero-external-dependency ACID persistence) and Bounded In-Memor
 to prevent memory leaks, eliminate data loss across process reloads, and ensure worker isolation.
 """
 
-from abc import ABC, abstractmethod
-from collections import deque
 import hashlib
 import json
 import os
 import sqlite3
 import threading
 import time
-from typing import Any, Dict, List, Optional
+from abc import ABC, abstractmethod
+from collections import deque
+from typing import Any
 
 
-def _compute_audit_entry_hash(prev_hash: str, payload: Dict[str, Any]) -> str:
+def _compute_audit_entry_hash(prev_hash: str, payload: dict[str, Any]) -> str:
     """Computes a deterministic SHA-256 link hash over the previous hash and canonical event JSON."""
     base = {k: v for k, v in payload.items() if k not in ("prev_hash", "entry_hash")}
     canonical = json.dumps(base, sort_keys=True, separators=(",", ":"))
-    return hashlib.sha256(f"{prev_hash}:{canonical}".encode("utf-8")).hexdigest()
+    return hashlib.sha256(f"{prev_hash}:{canonical}".encode()).hexdigest()
 
 
 class BaseStateStore(ABC):
     """Abstract Base Class for Enterprise MCP state persistence."""
 
     @abstractmethod
-    def save_ticket(self, ticket: Dict[str, Any]) -> None:
+    def save_ticket(self, ticket: dict[str, Any]) -> None:
         pass
 
     @abstractmethod
-    def get_ticket(self, ticket_id: str) -> Optional[Dict[str, Any]]:
+    def get_ticket(self, ticket_id: str) -> dict[str, Any] | None:
         pass
 
     @abstractmethod
-    def list_tickets(self) -> List[Dict[str, Any]]:
+    def list_tickets(self) -> list[dict[str, Any]]:
         pass
 
     @abstractmethod
-    def append_audit_event(self, event: Dict[str, Any]) -> Dict[str, Any]:
+    def append_audit_event(self, event: dict[str, Any]) -> dict[str, Any]:
         pass
 
     @abstractmethod
-    def get_audit_trail(self, limit: int = 100) -> List[Dict[str, Any]]:
+    def get_audit_trail(self, limit: int = 100) -> list[dict[str, Any]]:
         pass
 
     @abstractmethod
-    def verify_audit_chain(self) -> Dict[str, Any]:
+    def verify_audit_chain(self) -> dict[str, Any]:
         pass
 
     @abstractmethod
-    def save_snapshot(self, name: str, data: Dict[str, Any]) -> None:
+    def save_snapshot(self, name: str, data: dict[str, Any]) -> None:
         pass
 
     @abstractmethod
-    def get_snapshot(self, name: str) -> Optional[Dict[str, Any]]:
+    def get_snapshot(self, name: str) -> dict[str, Any] | None:
         pass
 
     @abstractmethod
-    def list_snapshots(self) -> List[str]:
+    def list_snapshots(self) -> list[str]:
         pass
 
     @abstractmethod
-    def record_span(self, span: Dict[str, Any]) -> None:
+    def record_span(self, span: dict[str, Any]) -> None:
         pass
 
     @abstractmethod
-    def get_spans(self, limit: int = 100) -> List[Dict[str, Any]]:
+    def get_spans(self, limit: int = 100) -> list[dict[str, Any]]:
         pass
 
     def close(self) -> None:
         """Closes underlying storage handles when applicable."""
-        return None
+        return
 
 
 class SQLiteStateStore(BaseStateStore):
@@ -160,7 +160,7 @@ class SQLiteStateStore(BaseStateStore):
                 """
             )
 
-    def save_ticket(self, ticket: Dict[str, Any]) -> None:
+    def save_ticket(self, ticket: dict[str, Any]) -> None:
         ticket_id = ticket["ticket_id"]
         tool_name = ticket.get("tool_name", "")
         status = ticket.get("status", "PENDING_APPROVAL")
@@ -182,7 +182,7 @@ class SQLiteStateStore(BaseStateStore):
                 (ticket_id, tool_name, status, requested_by, expires_at, created_at, payload),
             )
 
-    def get_ticket(self, ticket_id: str) -> Optional[Dict[str, Any]]:
+    def get_ticket(self, ticket_id: str) -> dict[str, Any] | None:
         with self._lock:
             cur = self._conn.execute("SELECT data_json FROM hitl_tickets WHERE ticket_id = ?;", (ticket_id,))
             row = cur.fetchone()
@@ -190,12 +190,12 @@ class SQLiteStateStore(BaseStateStore):
                 return json.loads(row["data_json"])
             return None
 
-    def list_tickets(self) -> List[Dict[str, Any]]:
+    def list_tickets(self) -> list[dict[str, Any]]:
         with self._lock:
             cur = self._conn.execute("SELECT data_json FROM hitl_tickets ORDER BY created_at DESC;")
             return [json.loads(r["data_json"]) for r in cur.fetchall()]
 
-    def append_audit_event(self, event: Dict[str, Any]) -> Dict[str, Any]:
+    def append_audit_event(self, event: dict[str, Any]) -> dict[str, Any]:
         event_type = event.get("event", "GENERIC_AUDIT")
         created_at = event.get("timestamp", time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()))
         with self._lock, self._conn:
@@ -212,12 +212,12 @@ class SQLiteStateStore(BaseStateStore):
             )
             return stored
 
-    def get_audit_trail(self, limit: int = 100) -> List[Dict[str, Any]]:
+    def get_audit_trail(self, limit: int = 100) -> list[dict[str, Any]]:
         with self._lock:
             cur = self._conn.execute("SELECT data_json FROM audit_events ORDER BY id DESC LIMIT ?;", (limit,))
             return [json.loads(r["data_json"]) for r in cur.fetchall()]
 
-    def verify_audit_chain(self) -> Dict[str, Any]:
+    def verify_audit_chain(self) -> dict[str, Any]:
         with self._lock:
             rows = self._conn.execute(
                 "SELECT id, data_json, prev_hash, entry_hash FROM audit_events ORDER BY id ASC;"
@@ -249,7 +249,7 @@ class SQLiteStateStore(BaseStateStore):
                 "backend": "sqlite_wal",
             }
 
-    def save_snapshot(self, name: str, data: Dict[str, Any]) -> None:
+    def save_snapshot(self, name: str, data: dict[str, Any]) -> None:
         created_at = data.get("created_at", time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()))
         payload = json.dumps(data)
         with self._lock, self._conn:
@@ -264,7 +264,7 @@ class SQLiteStateStore(BaseStateStore):
                 (name, payload, created_at),
             )
 
-    def get_snapshot(self, name: str) -> Optional[Dict[str, Any]]:
+    def get_snapshot(self, name: str) -> dict[str, Any] | None:
         with self._lock:
             cur = self._conn.execute("SELECT data_json FROM ledger_snapshots WHERE snapshot_name = ?;", (name,))
             row = cur.fetchone()
@@ -272,12 +272,12 @@ class SQLiteStateStore(BaseStateStore):
                 return json.loads(row["data_json"])
             return None
 
-    def list_snapshots(self) -> List[str]:
+    def list_snapshots(self) -> list[str]:
         with self._lock:
             cur = self._conn.execute("SELECT snapshot_name FROM ledger_snapshots ORDER BY created_at ASC;")
             return [r["snapshot_name"] for r in cur.fetchall()]
 
-    def record_span(self, span: Dict[str, Any]) -> None:
+    def record_span(self, span: dict[str, Any]) -> None:
         trace_id = span.get("trace_id", "")
         span_name = span.get("span_name", "")
         use_case = span.get("use_case", "")
@@ -294,7 +294,7 @@ class SQLiteStateStore(BaseStateStore):
                 (trace_id, span_name, use_case, status, payload, created_at),
             )
 
-    def get_spans(self, limit: int = 100) -> List[Dict[str, Any]]:
+    def get_spans(self, limit: int = 100) -> list[dict[str, Any]]:
         with self._lock:
             cur = self._conn.execute("SELECT data_json FROM telemetry_spans ORDER BY rowid DESC LIMIT ?;", (limit,))
             return [json.loads(r["data_json"]) for r in cur.fetchall()]
@@ -312,27 +312,27 @@ class InMemoryStateStore(BaseStateStore):
 
     def __init__(self, max_audit: int = 1000, max_spans: int = 2000):
         self._lock = threading.RLock()
-        self._tickets: Dict[str, Dict[str, Any]] = {}
-        self._audit_trail: deque[Dict[str, Any]] = deque(maxlen=max_audit)
+        self._tickets: dict[str, dict[str, Any]] = {}
+        self._audit_trail: deque[dict[str, Any]] = deque(maxlen=max_audit)
         self._audit_total_appended: int = 0
         self._last_audit_hash: str = "0" * 64
-        self._snapshots: Dict[str, Dict[str, Any]] = {}
-        self._spans: deque[Dict[str, Any]] = deque(maxlen=max_spans)
+        self._snapshots: dict[str, dict[str, Any]] = {}
+        self._spans: deque[dict[str, Any]] = deque(maxlen=max_spans)
 
-    def save_ticket(self, ticket: Dict[str, Any]) -> None:
+    def save_ticket(self, ticket: dict[str, Any]) -> None:
         with self._lock:
             self._tickets[ticket["ticket_id"]] = dict(ticket)
 
-    def get_ticket(self, ticket_id: str) -> Optional[Dict[str, Any]]:
+    def get_ticket(self, ticket_id: str) -> dict[str, Any] | None:
         with self._lock:
             ticket = self._tickets.get(ticket_id)
             return dict(ticket) if ticket else None
 
-    def list_tickets(self) -> List[Dict[str, Any]]:
+    def list_tickets(self) -> list[dict[str, Any]]:
         with self._lock:
             return [dict(t) for t in self._tickets.values()]
 
-    def append_audit_event(self, event: Dict[str, Any]) -> Dict[str, Any]:
+    def append_audit_event(self, event: dict[str, Any]) -> dict[str, Any]:
         with self._lock:
             prev_hash = self._last_audit_hash
             stored = {k: v for k, v in event.items() if k not in ("prev_hash", "entry_hash")}
@@ -344,12 +344,12 @@ class InMemoryStateStore(BaseStateStore):
             self._last_audit_hash = entry_hash
             return dict(stored)
 
-    def get_audit_trail(self, limit: int = 100) -> List[Dict[str, Any]]:
+    def get_audit_trail(self, limit: int = 100) -> list[dict[str, Any]]:
         with self._lock:
             items = list(self._audit_trail)
             return list(reversed(items[-limit:]))
 
-    def verify_audit_chain(self) -> Dict[str, Any]:
+    def verify_audit_chain(self) -> dict[str, Any]:
         with self._lock:
             events = list(self._audit_trail)
             if not events:
@@ -387,33 +387,33 @@ class InMemoryStateStore(BaseStateStore):
                 "backend": "in_memory_bounded",
             }
 
-    def save_snapshot(self, name: str, data: Dict[str, Any]) -> None:
+    def save_snapshot(self, name: str, data: dict[str, Any]) -> None:
         with self._lock:
             self._snapshots[name] = dict(data)
 
-    def get_snapshot(self, name: str) -> Optional[Dict[str, Any]]:
+    def get_snapshot(self, name: str) -> dict[str, Any] | None:
         with self._lock:
             snap = self._snapshots.get(name)
             return dict(snap) if snap else None
 
-    def list_snapshots(self) -> List[str]:
+    def list_snapshots(self) -> list[str]:
         with self._lock:
             return list(self._snapshots.keys())
 
-    def record_span(self, span: Dict[str, Any]) -> None:
+    def record_span(self, span: dict[str, Any]) -> None:
         with self._lock:
             self._spans.append(dict(span))
 
-    def get_spans(self, limit: int = 100) -> List[Dict[str, Any]]:
+    def get_spans(self, limit: int = 100) -> list[dict[str, Any]]:
         with self._lock:
             items = list(self._spans)
             return items[-limit:]
 
 
-_GLOBAL_STORE: Optional[BaseStateStore] = None
+_GLOBAL_STORE: BaseStateStore | None = None
 
 
-def get_default_storage(db_path: Optional[str] = None) -> BaseStateStore:
+def get_default_storage(db_path: str | None = None) -> BaseStateStore:
     """Returns or initializes the global storage backend (defaults to SQLite WAL persistence)."""
     global _GLOBAL_STORE
     if _GLOBAL_STORE is None:
@@ -427,7 +427,7 @@ def get_default_storage(db_path: Optional[str] = None) -> BaseStateStore:
     return _GLOBAL_STORE
 
 
-def reset_default_storage(store: Optional[BaseStateStore] = None) -> None:
+def reset_default_storage(store: BaseStateStore | None = None) -> None:
     """Resets global storage backend (useful in tests)."""
     global _GLOBAL_STORE
     _GLOBAL_STORE = store

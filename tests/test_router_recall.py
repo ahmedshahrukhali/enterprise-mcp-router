@@ -10,6 +10,14 @@ Evaluates semantic routing precision and top-k recall across all 8 enterprise do
   7. knowledge_graph
   8. portfolio_vsm
 """
+from src.registry.eval_dataset import (
+    FULL_EVAL_DATASET,
+    HELDOUT_EVAL_DATASET,
+    HELDOUT_PARAPHRASED_EVAL_DATASET,
+    HELDOUT_STANDARD_EVAL_DATASET,
+    TRAIN_EVAL_DATASET,
+    run_full_routing_benchmark,
+)
 from src.router import EnterpriseMCPRouter
 
 ROUTER_RECALL_TEST_CASES = [
@@ -80,16 +88,6 @@ def test_router_recall_across_all_domains():
 
     assert top1_acc >= 90.0, f"Top-1 recall {top1_acc:.1f}% fell below 90%"
     assert top3_acc >= 95.0, f"Top-3 recall {top3_acc:.1f}% fell below 95%"
-
-
-from src.registry.eval_dataset import (
-    FULL_EVAL_DATASET,
-    HELDOUT_EVAL_DATASET,
-    HELDOUT_PARAPHRASED_EVAL_DATASET,
-    HELDOUT_STANDARD_EVAL_DATASET,
-    TRAIN_EVAL_DATASET,
-    run_full_routing_benchmark,
-)
 
 
 def test_false_positive_resistance():

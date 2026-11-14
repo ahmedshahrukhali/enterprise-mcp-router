@@ -14,8 +14,9 @@ import json
 import re
 import time
 import uuid
+from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, ClassVar
 
 from src.adapters.agent_adapters import AgentFrameworkBridges, BedrockAgentCoreAdapter
 from src.connectors.data_connectors import (
@@ -27,6 +28,8 @@ from src.connectors.data_connectors import (
 )
 from src.registry.bge_embeddings import (
     DEFAULT_BGE_PROVIDER,
+)
+from src.registry.bge_embeddings import (
     cosine_similarity as bge_cosine_similarity,
 )
 from src.registry.catalog import (
@@ -45,9 +48,9 @@ class MCPToolSpec:
     description: str
     is_mutating: bool
     required_role: str
-    embedding: List[float]
+    embedding: list[float]
     domain: str = "enterprise"
-    input_schema: Dict[str, Any] = field(
+    input_schema: dict[str, Any] = field(
         default_factory=lambda: {
             "type": "object",
             "properties": {"query_or_id": {"type": "string"}},
@@ -80,9 +83,9 @@ class JSONSchemaContractValidator:
         return True
 
     @classmethod
-    def validate(cls, schema: Dict[str, Any], payload: Any) -> Dict[str, Any]:
+    def validate(cls, schema: dict[str, Any], payload: Any) -> dict[str, Any]:
         """Validates `payload` against a JSON Schema object contract."""
-        errors: List[str] = []
+        errors: list[str] = []
         expected_root = schema.get("type", "object")
         if expected_root == "object" and not isinstance(payload, dict):
             return {"valid": False, "errors": [f"expected object payload, got {type(payload).__name__}"]}
@@ -131,20 +134,20 @@ class EnterpriseMCPRouter:
 
     def __init__(
         self,
-        tools: Optional[List[MCPToolSpec]] = None,
-        storage: Optional[BaseStateStore] = None,
+        tools: list[MCPToolSpec] | None = None,
+        storage: BaseStateStore | None = None,
     ):
         if tools is None:
             tools = self._load_default_catalog_specs()
-        self.tools: Dict[str, MCPToolSpec] = {t.name: t for t in tools}
+        self.tools: dict[str, MCPToolSpec] = {t.name: t for t in tools}
         self.storage: BaseStateStore = storage or get_default_storage()
         # Hydrate persisted HITL tickets and recent audit events across restarts
-        self.hitl_tickets: Dict[str, Dict[str, Any]] = {
+        self.hitl_tickets: dict[str, dict[str, Any]] = {
             t["ticket_id"]: t for t in self.storage.list_tickets()
         }
-        self.audit_trail: List[Dict[str, Any]] = list(reversed(self.storage.get_audit_trail(limit=500)))
-        self.routing_feedback_stats: Dict[str, int] = {"total_feedback": 0, "hits": 0, "misses": 0}
-        self.routing_misses_eval_queue: List[Dict[str, Any]] = []
+        self.audit_trail: list[dict[str, Any]] = list(reversed(self.storage.get_audit_trail(limit=500)))
+        self.routing_feedback_stats: dict[str, int] = {"total_feedback": 0, "hits": 0, "misses": 0}
+        self.routing_misses_eval_queue: list[dict[str, Any]] = []
         self._bm25_index = self._build_bm25_index()
 
     def _build_bm25_index(self) -> OkapiBM25Index:
@@ -161,13 +164,13 @@ class EnterpriseMCPRouter:
     @classmethod
     def from_enterprise_catalog(
         cls,
-        storage: Optional[BaseStateStore] = None,
+        storage: BaseStateStore | None = None,
     ) -> "EnterpriseMCPRouter":
         """Instantiates router pre-loaded with the 120-tool Enterprise MCP Catalog."""
         return cls(tools=cls._load_default_catalog_specs(), storage=storage)
 
     @staticmethod
-    def _load_default_catalog_specs() -> List[MCPToolSpec]:
+    def _load_default_catalog_specs() -> list[MCPToolSpec]:
         raw = get_enterprise_tool_catalog()
         return [
             MCPToolSpec(
@@ -183,7 +186,7 @@ class EnterpriseMCPRouter:
             for item in raw
         ]
 
-    def route_top_k_tools(self, query_embedding: List[float], k: int = 5) -> List[str]:
+    def route_top_k_tools(self, query_embedding: list[float], k: int = 5) -> list[str]:
         """Filters large MCP tool registries down to top-k relevant tools via cosine dot product."""
         scored = []
         for name, spec in self.tools.items():
@@ -196,12 +199,12 @@ class EnterpriseMCPRouter:
         self,
         query: str,
         k: int = 5,
-        domain_filter: Optional[str] = None,
-        caller_roles: Optional[List[str]] = None,
+        domain_filter: str | None = None,
+        caller_roles: list[str] | None = None,
         scoring_mode: str = "hybrid",
-        weights: Optional[Tuple[float, float, float]] = None,
+        weights: tuple[float, float, float] | None = None,
         auto_widen: bool = False,
-    ) -> Dict[str, Any]:
+    ) -> dict[str, Any]:
         """
         Routes a natural language agent intent across the full 120+ tool registry,
         supporting 64-dim hashed embeddings, Okapi BM25, real 384-dim BAAI/bge-small-en-v1.5
@@ -217,15 +220,15 @@ class EnterpriseMCPRouter:
         if active_weights is None:
             active_weights = (0.45, 0.45, 0.10) if scoring_mode == "hybrid_bge_bm25" else (0.25, 0.65, 0.10)
 
-        candidates: List[MCPToolSpec] = [
+        candidates: list[MCPToolSpec] = [
             spec
             for spec in self.tools.values()
             if (not domain_filter or spec.domain == domain_filter)
             and (caller_roles is None or is_role_authorized(spec.required_role, caller_roles))
         ]
 
-        dense_scores: Dict[str, float] = {}
-        bm25_scores: Dict[str, float] = {}
+        dense_scores: dict[str, float] = {}
+        bm25_scores: dict[str, float] = {}
         for spec in candidates:
             if use_bge and q_bge is not None:
                 t_bge = DEFAULT_BGE_PROVIDER.embed_tool(spec.name, spec.domain, spec.description)
@@ -245,7 +248,7 @@ class EnterpriseMCPRouter:
         max_rrf = 2.0 / 61.0
         w_d, w_b, w_r = active_weights
 
-        scored_items: List[Tuple[float, float, float, MCPToolSpec]] = []
+        scored_items: list[tuple[float, float, float, MCPToolSpec]] = []
         for spec in candidates:
             d_score = dense_scores[spec.name]
             b_score = bm25_scores[spec.name]
@@ -317,9 +320,9 @@ class EnterpriseMCPRouter:
     def record_tool_selection_feedback(
         self,
         query: str,
-        routed_tools: List[str],
+        routed_tools: list[str],
         selected_tool: str,
-    ) -> Dict[str, Any]:
+    ) -> dict[str, Any]:
         """Logs whether the model's chosen tool appeared in routed top-k and captures misses for eval."""
         hit = selected_tool in routed_tools
         self.routing_feedback_stats["total_feedback"] += 1
@@ -345,7 +348,7 @@ class EnterpriseMCPRouter:
             "miss_queue_size": len(self.routing_misses_eval_queue),
         }
 
-    def validate_tool_arguments(self, tool_name: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
+    def validate_tool_arguments(self, tool_name: str, arguments: dict[str, Any]) -> dict[str, Any]:
         """Validates invocation arguments against the registered tool's JSON Schema contract."""
         spec = self.tools.get(tool_name)
         if not spec:
@@ -362,12 +365,12 @@ class EnterpriseMCPRouter:
         self,
         tool_name: str,
         requested_by: str,
-        user_roles: List[str],
-        arguments: Optional[Dict[str, Any]] = None,
+        user_roles: list[str],
+        arguments: dict[str, Any] | None = None,
         justification: str = "Agent requested execution of mutating enterprise tool.",
         ttl_seconds: int = 1800,
-        requester_groups: Optional[List[str]] = None,
-    ) -> Dict[str, Any]:
+        requester_groups: list[str] | None = None,
+    ) -> dict[str, Any]:
         """Creates a stateful Human-in-the-Loop (HITL) approval interrupt ticket with TTL expiration."""
         spec = self.tools.get(tool_name)
         ticket_id = f"HITL-{uuid.uuid4().hex[:8].upper()}"
@@ -418,9 +421,9 @@ class EnterpriseMCPRouter:
         reviewer: str,
         decision: str,
         notes: str = "",
-        reviewer_roles: Optional[List[str]] = None,
-        reviewer_groups: Optional[List[str]] = None,
-    ) -> Dict[str, Any]:
+        reviewer_roles: list[str] | None = None,
+        reviewer_groups: list[str] | None = None,
+    ) -> dict[str, Any]:
         """Approves or rejects a pending HITL interrupt ticket with separation-of-duties enforcement."""
         ticket = self.hitl_tickets.get(ticket_id)
         if not ticket:
@@ -466,12 +469,12 @@ class EnterpriseMCPRouter:
     def authorize_execution(
         self,
         tool_name: str,
-        user_roles: List[str],
+        user_roles: list[str],
         hitl_approved: bool = False,
-        hitl_ticket_id: Optional[str] = None,
+        hitl_ticket_id: str | None = None,
         require_ticket: bool = False,
-        arguments: Optional[Dict[str, Any]] = None,
-    ) -> Dict[str, Any]:
+        arguments: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         """Enforces deterministic RBAC hierarchy and hash-bound HITL approval before tool execution."""
         spec = self.tools.get(tool_name)
         if not spec:
@@ -547,14 +550,14 @@ class EnterpriseMCPRouter:
                     "is_mutating": True,
                 }
 
-        audit_event = {
+        authorized_audit_event: dict[str, Any] = {
             "event": "EXECUTION_AUTHORIZED",
             "tool_name": tool_name,
             "user_roles": user_roles,
             "hitl_approved": hitl_approved,
         }
-        self.audit_trail.append(audit_event)
-        self.storage.append_audit_event(audit_event)
+        self.audit_trail.append(authorized_audit_event)
+        self.storage.append_audit_event(authorized_audit_event)
         return {
             "allowed": True,
             "reason": "authorized",
@@ -577,7 +580,7 @@ class FastMCPServer:
       - `prompts/list`, `prompts/get`
     """
 
-    _PY_TYPE_TO_JSON = {
+    _PY_TYPE_TO_JSON: ClassVar[dict[type, str]] = {
         str: "string",
         int: "integer",
         float: "number",
@@ -586,7 +589,7 @@ class FastMCPServer:
         list: "array",
     }
 
-    _PROMPTS_CATALOG: Dict[str, Dict[str, Any]] = {
+    _PROMPTS_CATALOG: ClassVar[dict[str, dict[str, Any]]] = {
         "vsm_management_concern_briefing": {
             "name": "vsm_management_concern_briefing",
             "description": "Analyze connected OKRs, product portfolios, and blocked engineering tickets to surface management concerns and corrective actions.",
@@ -611,20 +614,20 @@ class FastMCPServer:
         self,
         name: str = "enterprise-mcp-router",
         version: str = "2.2.0",
-        router: Optional[EnterpriseMCPRouter] = None,
-        connectors: Optional[Dict[str, Any]] = None,
+        router: EnterpriseMCPRouter | None = None,
+        connectors: dict[str, Any] | None = None,
     ):
         self.name = name
         self.version = version
         self.router = router or EnterpriseMCPRouter.from_enterprise_catalog()
-        self.custom_handlers: Dict[str, Callable[..., Any]] = {}
+        self.custom_handlers: dict[str, Callable[..., Any]] = {}
         self.connectors = connectors or {}
 
     @classmethod
-    def _infer_schema_from_fn(cls, fn: Callable[..., Any]) -> Dict[str, Any]:
+    def _infer_schema_from_fn(cls, fn: Callable[..., Any]) -> dict[str, Any]:
         sig = inspect.signature(fn)
-        properties: Dict[str, Dict[str, Any]] = {}
-        required: List[str] = []
+        properties: dict[str, dict[str, Any]] = {}
+        required: list[str] = []
         for param_name, param in sig.parameters.items():
             json_type = cls._PY_TYPE_TO_JSON.get(param.annotation, "string")
             properties[param_name] = {"type": json_type}
@@ -634,7 +637,7 @@ class FastMCPServer:
 
     def tool(
         self,
-        name: Optional[str] = None,
+        name: str | None = None,
         description: str = "",
         is_mutating: bool = False,
         required_role: str = "analyst",
@@ -660,7 +663,7 @@ class FastMCPServer:
 
         return decorator
 
-    def _dispatch_builtin_connector(self, tool_name: str, arguments: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    def _dispatch_builtin_connector(self, tool_name: str, arguments: dict[str, Any]) -> dict[str, Any] | None:
         vsm = self.connectors.get("vsm")
         sf = self.connectors.get("snowflake")
         pg = self.connectors.get("postgres")
@@ -766,9 +769,9 @@ class FastMCPServer:
 
     def handle_jsonrpc(
         self,
-        request_payload: Dict[str, Any],
-        principal: Optional[AuthenticatedPrincipal] = None,
-    ) -> Dict[str, Any]:
+        request_payload: dict[str, Any],
+        principal: AuthenticatedPrincipal | None = None,
+    ) -> dict[str, Any]:
         """Processes a standard JSON-RPC 2.0 Model Context Protocol request with verified identity."""
         req_id = request_payload.get("id", 1)
         method = request_payload.get("method", "")
@@ -850,7 +853,7 @@ class FastMCPServer:
                 }
                 for s in page_specs
             ]
-            res_payload: Dict[str, Any] = {
+            res_payload: dict[str, Any] = {
                 "tools": all_tools,
                 "total_registered_tools": len(self.router.tools),
                 "total_filtered_tools": len(filtered_specs),
@@ -956,7 +959,7 @@ class FastMCPServer:
 
         if method == "resources/read":
             uri = params.get("uri", "")
-            resource_map: Dict[str, Any] = {
+            resource_map: dict[str, Any] = {
                 "snowflake://PORTFOLIO_GOLD/CORTEX_DOCS": {
                     "allowed_roles": ["ai_platform_reader", "analyst", "data_engineer"],
                     "schemas": ["PORTFOLIO_GOLD", "CORTEX_DOCS"],
@@ -1007,14 +1010,14 @@ class FastMCPServer:
         if method == "prompts/get":
             prompt_name = params.get("name", "")
             prompt_args = params.get("arguments") or {}
-            spec = self._PROMPTS_CATALOG.get(prompt_name)
-            if not spec:
+            prompt_spec = self._PROMPTS_CATALOG.get(prompt_name)
+            if not prompt_spec:
                 return {
                     "jsonrpc": "2.0",
                     "id": req_id,
                     "error": {"code": -32602, "message": f"Prompt not found: {prompt_name}"},
                 }
-            rendered = spec["template"].format(
+            rendered = prompt_spec["template"].format(
                 portfolio_id=prompt_args.get("portfolio_id", "ALL"),
                 schema_name=prompt_args.get("schema_name", "PORTFOLIO_GOLD"),
                 repo_name=prompt_args.get("repo_name", "enterprise-mcp-router"),
@@ -1023,7 +1026,7 @@ class FastMCPServer:
                 "jsonrpc": "2.0",
                 "id": req_id,
                 "result": {
-                    "description": spec["description"],
+                    "description": prompt_spec["description"],
                     "messages": [{"role": "user", "content": {"type": "text", "text": rendered}}],
                 },
             }

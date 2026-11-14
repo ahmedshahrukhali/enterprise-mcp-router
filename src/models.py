@@ -2,22 +2,23 @@
 Pydantic v2 Schemas & Data Contracts for Enterprise-MCP-Router.
 """
 
-from typing import Any, Dict, List, Optional
+from typing import Any
+
 from pydantic import BaseModel, Field
 
 
 class MCPJsonRpcRequest(BaseModel):
     jsonrpc: str = Field(default="2.0", description="JSON-RPC protocol version")
-    id: Optional[Any] = Field(default=1, description="Request correlation ID")
+    id: Any | None = Field(default=1, description="Request correlation ID")
     method: str = Field(..., description="MCP method (e.g., initialize, tools/list, tools/call, resources/list)")
-    params: Dict[str, Any] = Field(default_factory=dict, description="Method parameters")
+    params: dict[str, Any] = Field(default_factory=dict, description="Method parameters")
 
 
 class MCPJsonRpcResponse(BaseModel):
     jsonrpc: str = "2.0"
-    id: Optional[Any] = 1
-    result: Optional[Dict[str, Any]] = None
-    error: Optional[Dict[str, Any]] = None
+    id: Any | None = 1
+    result: dict[str, Any] | None = None
+    error: dict[str, Any] | None = None
 
 
 class SemanticRouteRequest(BaseModel):
@@ -26,7 +27,7 @@ class SemanticRouteRequest(BaseModel):
         description="Natural language agent intent or user query",
     )
     top_k: int = Field(default=5, ge=1, le=25, description="Number of top semantic tools to route")
-    domain_filter: Optional[str] = Field(default=None, description="Optional enterprise namespace filter")
+    domain_filter: str | None = Field(default=None, description="Optional enterprise namespace filter")
     scoring_mode: str = Field(
         default="hybrid",
         pattern="^(hybrid|dense_only|bm25_only|bge_small_only|hybrid_bge_bm25)$",
@@ -45,39 +46,39 @@ class RoutedToolItem(BaseModel):
     is_mutating: bool
     required_role: str
     similarity_score: float
-    dense_score: Optional[float] = None
-    bm25_score: Optional[float] = None
+    dense_score: float | None = None
+    bm25_score: float | None = None
     schema_tokens: int
-    input_schema: Optional[Dict[str, Any]] = None
+    input_schema: dict[str, Any] | None = None
 
 
 class SemanticRouteResponse(BaseModel):
     query: str
     top_k: int
-    effective_k: Optional[int] = None
+    effective_k: int | None = None
     widened_k: bool = False
     scoring_mode: str = "hybrid"
-    caller_roles_applied: List[str] = Field(default_factory=list)
+    caller_roles_applied: list[str] = Field(default_factory=list)
     total_registered_tools: int
-    total_accessible_tools: Optional[int] = None
+    total_accessible_tools: int | None = None
     full_registry_tokens: int
     routed_tokens: int
     token_reduction_pct: float
     routing_latency_ms: float
-    routed_tools: List[RoutedToolItem]
+    routed_tools: list[RoutedToolItem]
 
 
 class AuthorizationRequest(BaseModel):
     tool_name: str = Field(..., description="Target MCP tool name")
-    hitl_ticket_id: Optional[str] = Field(
+    hitl_ticket_id: str | None = Field(
         default=None, description="Server-issued approved HITL ticket ID bound to canonical arguments"
     )
-    arguments: Dict[str, Any] = Field(default_factory=dict, description="Tool invocation arguments")
+    arguments: dict[str, Any] = Field(default_factory=dict, description="Tool invocation arguments")
 
 
 class HITLCreateRequest(BaseModel):
     tool_name: str = Field(..., description="Mutating tool requiring human approval")
-    arguments: Dict[str, Any] = Field(default_factory=dict)
+    arguments: dict[str, Any] = Field(default_factory=dict)
     justification: str = Field(default="Automated S&OP / treasury rebalance execution")
     ttl_seconds: int = Field(default=1800, ge=-3600, le=86400, description="Ticket expiration TTL in seconds")
 
@@ -99,7 +100,7 @@ class AuthTokenRequest(BaseModel):
 
 class RoutingFeedbackRequest(BaseModel):
     query: str = Field(..., min_length=1)
-    routed_tools: List[str] = Field(default_factory=list)
+    routed_tools: list[str] = Field(default_factory=list)
     selected_tool: str = Field(..., min_length=1)
 
 
@@ -133,7 +134,7 @@ class PostgresQueryRequest(BaseModel):
         default="SELECT account_id, portfolio_name, balance_usd, risk_tier FROM accounts ORDER BY balance_usd DESC",
         description="Parameterized SQL query against PostgreSQL enterprise ledger",
     )
-    params: List[Any] = Field(default_factory=list)
+    params: list[Any] = Field(default_factory=list)
     role: str = Field(default="analyst")
 
 
@@ -146,7 +147,7 @@ class BedrockStructuredInvokeRequest(BaseModel):
         default="Analyze portfolio compliance for Fund POL-101 and output structured risk assessment.",
         description="Prompt sent to Amazon Bedrock Converse API",
     )
-    required_keys: List[str] = Field(
+    required_keys: list[str] = Field(
         default_factory=lambda: ["summary", "risk_tier", "recommended_action", "confidence_score"]
     )
     simulate_flaky_first_attempt: bool = Field(
@@ -162,7 +163,7 @@ class TelemetrySpanRequest(BaseModel):
     status: str = Field(default="OK")
     prompt_tokens: int = Field(default=620)
     completion_tokens: int = Field(default=185)
-    error_message: Optional[str] = Field(default=None)
+    error_message: str | None = Field(default=None)
 
 
 class RunbookLookupRequest(BaseModel):
@@ -172,7 +173,7 @@ class RunbookLookupRequest(BaseModel):
 
 class SchemaValidationRequest(BaseModel):
     tool_name: str = Field(..., description="Target registered MCP tool name")
-    arguments: Dict[str, Any] = Field(default_factory=dict, description="Invocation arguments to validate")
+    arguments: dict[str, Any] = Field(default_factory=dict, description="Invocation arguments to validate")
 
 
 class VSMConcernRequest(BaseModel):
@@ -180,7 +181,7 @@ class VSMConcernRequest(BaseModel):
         default="Identify management concerns across OKRs, product portfolios, and blocked engineering tickets and suggest actions",
         description="Natural language steering or risk question for the VSM Copilot",
     )
-    portfolio_id: Optional[str] = Field(default=None, description="Optional target product portfolio ID (e.g. PF-101)")
+    portfolio_id: str | None = Field(default=None, description="Optional target product portfolio ID (e.g. PF-101)")
 
 
 class VSMSqlQueryRequest(BaseModel):
@@ -195,5 +196,5 @@ class VSMSqlQueryRequest(BaseModel):
         ),
         description="Read-only relational SQL query across product_portfolios, objectives_okrs, and engineering_tickets",
     )
-    params: List[Any] = Field(default_factory=list)
+    params: list[Any] = Field(default_factory=list)
     role: str = Field(default="analyst")

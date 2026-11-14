@@ -5,8 +5,10 @@ Prevents SQL injection, stacked multi-statement execution, DDL/DML mutations,
 and SELECT ... INTO subclause bypasses without false positives on legitimate column/table names.
 """
 
-from typing import Any, Dict, Optional, Set
+from typing import Any, ClassVar
+
 import sqlglot
+from sqlglot import errors as sqlglot_errors
 from sqlglot import exp
 
 
@@ -29,7 +31,7 @@ class SafeSQLValidator:
         exp.Command,
     )
 
-    ALLOWED_SQL_FUNCTIONS: Set[str] = {
+    ALLOWED_SQL_FUNCTIONS: ClassVar[set[str]] = {
         "ABS",
         "AVG",
         "CASE",
@@ -74,13 +76,13 @@ class SafeSQLValidator:
         cls,
         sql: str,
         dialect: str = "snowflake",
-        allowed_roles: Optional[Set[str]] = None,
-        allowed_schemas: Optional[Set[str]] = None,
-        allowed_tables: Optional[Set[str]] = None,
+        allowed_roles: set[str] | None = None,
+        allowed_schemas: set[str] | None = None,
+        allowed_tables: set[str] | None = None,
         require_qualified_tables: bool = False,
-        role: Optional[str] = None,
-        schema: Optional[str] = None,
-    ) -> Dict[str, Any]:
+        role: str | None = None,
+        schema: str | None = None,
+    ) -> dict[str, Any]:
         """
         Validates that a SQL string is strictly read-only, non-stacked, and adheres to RBAC.
 
@@ -92,24 +94,22 @@ class SafeSQLValidator:
           - schema: Optional[str]
         """
         # 1. RBAC role check
-        if allowed_roles is not None and role is not None:
-            if role not in allowed_roles:
-                return {
-                    "valid": False,
-                    "reason": "snowflake_rbac_role_denied" if dialect == "snowflake" else "rbac_role_denied",
-                    "role": role,
-                    "schema": schema,
-                }
+        if allowed_roles is not None and role is not None and role not in allowed_roles:
+            return {
+                "valid": False,
+                "reason": "snowflake_rbac_role_denied" if dialect == "snowflake" else "rbac_role_denied",
+                "role": role,
+                "schema": schema,
+            }
 
         # 2. Schema allow-list check
-        if allowed_schemas is not None and schema is not None:
-            if schema not in allowed_schemas:
-                return {
-                    "valid": False,
-                    "reason": "snowflake_schema_not_allowlisted" if dialect == "snowflake" else "schema_not_allowlisted",
-                    "role": role,
-                    "schema": schema,
-                }
+        if allowed_schemas is not None and schema is not None and schema not in allowed_schemas:
+            return {
+                "valid": False,
+                "reason": "snowflake_schema_not_allowlisted" if dialect == "snowflake" else "schema_not_allowlisted",
+                "role": role,
+                "schema": schema,
+            }
 
         cleaned = sql.strip()
         if not cleaned:
@@ -118,7 +118,7 @@ class SafeSQLValidator:
         # 3. Parse AST using sqlglot
         try:
             parsed = sqlglot.parse(cleaned, read=dialect)
-        except Exception as exc:
+        except (sqlglot_errors.SqlglotError, ValueError, TypeError) as exc:
             return {
                 "valid": False,
                 "reason": "invalid_sql_syntax",
@@ -193,7 +193,7 @@ class SafeSQLValidator:
         upper_allowed_tables = {t.upper() for t in allowed_tables} if allowed_tables is not None else None
         allowlisted_short_names = {t.split(".")[-1] for t in (upper_allowed_tables or set())}
 
-        valid_cte_aliases: Set[str] = set()
+        valid_cte_aliases: set[str] = set()
         for cte in stmt.find_all(exp.CTE):
             alias = (cte.alias_or_name or "").strip().upper()
             if not alias:

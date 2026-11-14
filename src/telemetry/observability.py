@@ -6,7 +6,7 @@ and Standardized L2 Operational Support Runbook Generator.
 import math
 import uuid
 from dataclasses import asdict, dataclass
-from typing import Any, Dict, List, Optional
+from typing import Any, ClassVar
 
 
 @dataclass
@@ -18,7 +18,7 @@ class TraceSpan:
     status: str
     prompt_tokens: int = 0
     completion_tokens: int = 0
-    error_message: Optional[str] = None
+    error_message: str | None = None
     traceparent: str = ""
 
     def __post_init__(self) -> None:
@@ -36,7 +36,7 @@ class ProductionTelemetryMonitor:
     runbook entries for L2 incident triage.
     """
 
-    RUNBOOK_CATALOG: Dict[str, Dict[str, str]] = {
+    RUNBOOK_CATALOG: ClassVar[dict[str, dict[str, str]]] = {
         "iics_taskflow_failed": {
             "severity": "SEV-2 (Data Pipeline SLA Breach)",
             "sla_target": "15 minutes",
@@ -101,9 +101,9 @@ class ProductionTelemetryMonitor:
         self.token_budget_per_use_case = token_budget_per_use_case
         self.max_spans = max_spans
         self.max_alerts = max_alerts
-        self.spans: List[TraceSpan] = []
-        self.token_usage_by_use_case: Dict[str, int] = {}
-        self.alerts: List[Dict[str, Any]] = []
+        self.spans: list[TraceSpan] = []
+        self.token_usage_by_use_case: dict[str, int] = {}
+        self.alerts: list[dict[str, Any]] = []
 
     def record_span(
         self,
@@ -113,7 +113,7 @@ class ProductionTelemetryMonitor:
         status: str = "OK",
         prompt_tokens: int = 0,
         completion_tokens: int = 0,
-        error_message: Optional[str] = None,
+        error_message: str | None = None,
     ) -> TraceSpan:
         """Records an execution trace span, aggregates token usage, and triggers alerts."""
         total_tokens = prompt_tokens + completion_tokens
@@ -161,15 +161,15 @@ class ProductionTelemetryMonitor:
 
         return span
 
-    def get_summary_metrics(self) -> Dict[str, Any]:
+    def get_summary_metrics(self) -> dict[str, Any]:
         latencies = sorted(s.latency_ms for s in self.spans)
         n = len(latencies)
         if n == 0:
             p50 = p95 = p99 = 0.0
         else:
-            p50 = latencies[min(int(math.floor(0.50 * (n - 1))), n - 1)]
-            p95 = latencies[min(int(math.floor(0.95 * (n - 1))), n - 1)]
-            p99 = latencies[min(int(math.floor(0.99 * (n - 1))), n - 1)]
+            p50 = latencies[min(math.floor(0.50 * (n - 1)), n - 1)]
+            p95 = latencies[min(math.floor(0.95 * (n - 1)), n - 1)]
+            p99 = latencies[min(math.floor(0.99 * (n - 1)), n - 1)]
 
         total_tokens = sum(self.token_usage_by_use_case.values())
         error_spans = sum(1 for s in self.spans if s.status != "OK" or s.error_message)
@@ -187,7 +187,7 @@ class ProductionTelemetryMonitor:
             "recent_spans": [asdict(s) for s in self.spans[-12:]],
         }
 
-    def generate_runbook_entry(self, incident_type: str, component: str) -> Dict[str, str]:
+    def generate_runbook_entry(self, incident_type: str, component: str) -> dict[str, str]:
         """Generates a standardized L2 operational runbook procedure for incident triage."""
         entry = self.RUNBOOK_CATALOG.get(incident_type)
         if entry:
