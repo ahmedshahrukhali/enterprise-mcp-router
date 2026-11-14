@@ -11,6 +11,7 @@ Exposes:
 - OpenTelemetry Tracing, Token Budgets & L2 Operational Runbooks (`/api/v1/telemetry/*`)
 """
 
+from contextlib import asynccontextmanager
 import json
 import os
 import time
@@ -23,8 +24,11 @@ from src.security import (
     AuthenticatedPrincipal,
     create_jwt_token,
     enforce_rate_limit,
+    is_dev_mode,
     is_role_authorized,
+    validate_security_config,
 )
+from src.storage import SQLiteStateStore
 from src.models import (
     AuthorizationRequest,
     AuthTokenRequest,
@@ -57,14 +61,22 @@ from src.router import (
     ValueStreamManagementConnector,
 )
 
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    """Refuses server startup unless JWT/OIDC credentials or explicit dev mode are configured."""
+    validate_security_config()
+    yield
+
+
 app = FastAPI(
     title="Enterprise-MCP-Router",
     description=(
-        "Enterprise Model Context Protocol (FastMCP / JSON-RPC 2.0 + SSE) Server, 120-Tool Hybrid BM25+Dense Router, "
-        "RBAC/JSON Schema/HITL Governance Gate, Value Stream Management (OKRs, Portfolios, Engineering Tickets), "
-        "Cloud Data Connectors (Snowflake Cortex, Informatica IICS, SQLite/PostgreSQL), and Amazon Bedrock Observability."
+        "FastMCP / JSON-RPC 2.0 + SSE Server, 120-Tool Semantic & BM25 Router, "
+        "RBAC/JSON Schema/HITL Governance Gate, Value Stream Management, "
+        "Cloud Data Connectors (Snowflake Cortex, Informatica IICS, SQLite/PostgreSQL), and Bedrock Observability."
     ),
     version="2.2.0",
+    lifespan=lifespan,
 )
 
 # Singleton service instances initialized with realistic enterprise state
@@ -111,13 +123,15 @@ telemetry_monitor.record_span(
     prompt_tokens=410,
     completion_tokens=215,
 )
-mcp_router.create_hitl_interrupt(
-    tool_name="postgres.execute_outbound_wire",
-    requested_by="treasury_rebalance_agent",
-    user_roles=["platform_admin"],
-    arguments={"from_account": "ACC-9001", "to_account": "ACC-9003", "amount_usd": 50000.0},
-    justification="Scheduled institutional liquidity sweep exceeding $25k auto-approval threshold.",
-)
+if not mcp_router.hitl_tickets:
+    mcp_router.create_hitl_interrupt(
+        tool_name="postgres.execute_outbound_wire",
+        requested_by="treasury_rebalance_agent",
+        user_roles=["platform_admin"],
+        arguments={"from_account": "ACC-9001", "to_account": "ACC-9003", "amount_usd": 50000.0},
+        justification="Scheduled institutional liquidity sweep exceeding $25k auto-approval threshold.",
+        requester_groups=["platform_operators"],
+    )
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -128,12 +142,15 @@ def serve_dashboard() -> HTMLResponse:
 
 @app.get("/health")
 def health_check() -> Dict[str, Any]:
-    """Returns service health, registered tool count, and active governance status."""
+    """Returns service health, registered tool count, storage backend, and governance status."""
+    storage_backend = "sqlite_wal" if isinstance(mcp_router.storage, SQLiteStateStore) else "in_memory_bounded"
     return {
         "status": "healthy",
         "version": "2.2.0",
         "service": "enterprise-mcp-router",
         "protocol": "FastMCP / JSON-RPC 2.0 + SSE",
+        "dev_mode": is_dev_mode(),
+        "storage_backend": storage_backend,
         "total_registered_tools": len(mcp_router.tools),
         "domains": sorted({t.domain for t in mcp_router.tools.values()}),
         "pending_hitl_tickets": sum(
@@ -184,17 +201,23 @@ def issue_session_jwt(
     principal: AuthenticatedPrincipal = Depends(enforce_rate_limit),
 ) -> Dict[str, Any]:
     """
-    Mints a short-lived HS256 JWT bearer token for local/UI RBAC persona switching.
-    In production deployments backed by an external OIDC IdP, set MCP_DISABLE_DEMO_TOKEN_MINT=1.
+    Mints a short-lived HS256 JWT bearer token strictly in dev mode (ROUTER_DEV_MODE=1).
+    Disabled by default and capped to the platform_operators group (cannot mint super_admin or hitl_approvers).
     """
-    if os.getenv("MCP_DISABLE_DEMO_TOKEN_MINT", "0") == "1":
-        raise HTTPException(status_code=403, detail="demo_token_minting_disabled")
-    token = create_jwt_token(username=req.username, roles=[req.role], expires_in_seconds=3600)
+    if not is_dev_mode() or os.getenv("MCP_DISABLE_DEMO_TOKEN_MINT", "0") == "1":
+        raise HTTPException(status_code=403, detail="token_minting_disabled_unless_dev_mode")
+    token = create_jwt_token(
+        username=req.username,
+        roles=[req.role],
+        groups=["platform_operators"],
+        expires_in_seconds=3600,
+    )
     return {
         "access_token": token,
         "token_type": "Bearer",
         "username": req.username,
         "roles": [req.role],
+        "groups": ["platform_operators"],
         "expires_in": 3600,
     }
 
@@ -268,7 +291,10 @@ def authorize_tool_call(
 
 
 @app.post("/api/v1/governance/validate-schema")
-def validate_tool_schema(req: SchemaValidationRequest) -> Dict[str, Any]:
+def validate_tool_schema(
+    req: SchemaValidationRequest,
+    principal: AuthenticatedPrincipal = Depends(enforce_rate_limit),
+) -> Dict[str, Any]:
     """Validates tool arguments against the tool's registered JSON Schema Draft-07 contract."""
     return mcp_router.validate_tool_arguments(
         tool_name=req.tool_name,
@@ -277,14 +303,18 @@ def validate_tool_schema(req: SchemaValidationRequest) -> Dict[str, Any]:
 
 
 @app.get("/api/v1/governance/hitl")
-def list_hitl_tickets() -> Dict[str, Any]:
+def list_hitl_tickets(
+    principal: AuthenticatedPrincipal = Depends(enforce_rate_limit),
+) -> Dict[str, Any]:
     """Lists all Human-in-the-Loop (HITL) approval interrupt tickets from durable storage."""
     tickets = mcp_router.storage.list_tickets()
     return {"total": len(tickets), "tickets": tickets}
 
 
 @app.get("/api/v1/governance/audit-verify")
-def verify_audit_hash_chain() -> Dict[str, Any]:
+def verify_audit_hash_chain(
+    principal: AuthenticatedPrincipal = Depends(enforce_rate_limit),
+) -> Dict[str, Any]:
     """Verifies SHA-256 hash-chain tamper integrity across persisted append-only audit events."""
     chain = mcp_router.storage.verify_audit_chain()
     return {
@@ -322,6 +352,7 @@ def create_hitl_ticket(
         arguments=req.arguments,
         justification=req.justification,
         ttl_seconds=req.ttl_seconds,
+        requester_groups=principal.groups,
     )
 
 
@@ -340,10 +371,11 @@ def resolve_hitl_ticket(
         decision=req.decision,
         notes=req.notes,
         reviewer_roles=principal.roles,
+        reviewer_groups=principal.groups,
     )
     if result.get("status") == "error":
         reason = result.get("reason", "")
-        if "prohibited" in reason or "not_authorized" in reason:
+        if "prohibited" in reason or "not_authorized" in reason or "missing_approver_group" in reason:
             return JSONResponse(status_code=403, content=result)
         if "not_found" in reason:
             return JSONResponse(status_code=404, content=result)
@@ -354,19 +386,28 @@ def resolve_hitl_ticket(
 
 
 @app.get("/api/v1/vsm/overview")
-def get_vsm_overview(portfolio_id: Optional[str] = None) -> Dict[str, Any]:
+def get_vsm_overview(
+    portfolio_id: Optional[str] = None,
+    principal: AuthenticatedPrincipal = Depends(enforce_rate_limit),
+) -> Dict[str, Any]:
     """Returns connected product portfolios, OKRs, and engineering work tickets."""
     return vsm_connector.get_overview(portfolio_id=portfolio_id)
 
 
 @app.post("/api/v1/vsm/query")
-def query_vsm_relational(req: VSMSqlQueryRequest) -> Dict[str, Any]:
+def query_vsm_relational(
+    req: VSMSqlQueryRequest,
+    principal: AuthenticatedPrincipal = Depends(enforce_rate_limit),
+) -> Dict[str, Any]:
     """Executes read-only relational SQL queries across product portfolios, OKRs, and tickets."""
     return vsm_connector.query_vsm_sql(sql=req.sql, role=req.role, params=req.params)
 
 
 @app.post("/api/v1/vsm/analyze-concerns")
-def analyze_vsm_concerns(req: VSMConcernRequest) -> Dict[str, Any]:
+def analyze_vsm_concerns(
+    req: VSMConcernRequest,
+    principal: AuthenticatedPrincipal = Depends(enforce_rate_limit),
+) -> Dict[str, Any]:
     """Detects management concerns across OKRs, portfolios & tickets and recommends governed MCP actions."""
     t0 = time.perf_counter()
     res = vsm_connector.analyze_management_concerns(
@@ -389,8 +430,11 @@ def analyze_vsm_concerns(req: VSMConcernRequest) -> Dict[str, Any]:
 
 
 @app.post("/api/v1/connectors/snowflake/validate-sql")
-def validate_snowflake_sql(req: SnowflakeSQLValidationRequest) -> Dict[str, Any]:
-    """Validates read-only Snowflake SQL against RBAC, schema allow-list, and DDL/DML blocklist."""
+def validate_snowflake_sql(
+    req: SnowflakeSQLValidationRequest,
+    principal: AuthenticatedPrincipal = Depends(enforce_rate_limit),
+) -> Dict[str, Any]:
+    """Validates read-only Snowflake SQL against RBAC, schema/table allow-lists, and AST checks."""
     return snowflake_connector.validate_readonly_sql(
         sql=req.sql,
         role=req.role,
@@ -399,7 +443,10 @@ def validate_snowflake_sql(req: SnowflakeSQLValidationRequest) -> Dict[str, Any]
 
 
 @app.post("/api/v1/connectors/snowflake/cortex-search")
-def query_snowflake_cortex(req: SnowflakeCortexQueryRequest) -> Dict[str, Any]:
+def query_snowflake_cortex(
+    req: SnowflakeCortexQueryRequest,
+    principal: AuthenticatedPrincipal = Depends(enforce_rate_limit),
+) -> Dict[str, Any]:
     """Executes governed Snowflake Cortex Search retrieval over enterprise compliance docs."""
     return snowflake_connector.retrieve_cortex_rag(
         query=req.query,
@@ -409,19 +456,28 @@ def query_snowflake_cortex(req: SnowflakeCortexQueryRequest) -> Dict[str, Any]:
 
 
 @app.post("/api/v1/connectors/informatica/validate")
-def validate_informatica_taskflow(req: IICSTaskflowWebhookPayload) -> Dict[str, Any]:
+def validate_informatica_taskflow(
+    req: IICSTaskflowWebhookPayload,
+    principal: AuthenticatedPrincipal = Depends(enforce_rate_limit),
+) -> Dict[str, Any]:
     """Validates Informatica Cloud (IICS) ELT taskflow SLA and row counts prior to RAG indexing."""
     return informatica_adapter.validate_taskflow_run(req.model_dump())
 
 
 @app.post("/api/v1/connectors/postgres/query")
-def query_postgres_ledger(req: PostgresQueryRequest) -> Dict[str, Any]:
+def query_postgres_ledger(
+    req: PostgresQueryRequest,
+    principal: AuthenticatedPrincipal = Depends(enforce_rate_limit),
+) -> Dict[str, Any]:
     """Executes read-only parameterized SQL query against the relational ledger."""
     return postgres_connector.query_ledger(sql=req.sql, role=req.role, params=req.params)
 
 
 @app.post("/api/v1/connectors/postgres/snapshot/create")
-def create_postgres_snapshot(req: PostgresSnapshotRequest) -> Dict[str, Any]:
+def create_postgres_snapshot(
+    req: PostgresSnapshotRequest,
+    principal: AuthenticatedPrincipal = Depends(enforce_rate_limit),
+) -> Dict[str, Any]:
     """Creates a point-in-time state snapshot of the relational ledger."""
     return postgres_connector.create_snapshot(req.snapshot_name)
 
@@ -438,8 +494,10 @@ def restore_postgres_snapshot(
 
 
 @app.get("/api/v1/router/benchmark")
-def get_router_benchmark() -> Dict[str, Any]:
-    """Returns cached honest 160-query Recall@k and ablation measurements over serialized schemas."""
+def get_router_benchmark(
+    principal: AuthenticatedPrincipal = Depends(enforce_rate_limit),
+) -> Dict[str, Any]:
+    """Returns cached train & held-out Recall@k and ablation measurements over serialized schemas."""
     cached = getattr(app.state, "benchmark_cache", None)
     if cached is None:
         from src.registry.eval_dataset import run_full_routing_benchmark
@@ -450,7 +508,10 @@ def get_router_benchmark() -> Dict[str, Any]:
 
 
 @app.post("/api/v1/adapters/bedrock/invoke")
-def invoke_bedrock_structured(req: BedrockStructuredInvokeRequest) -> Dict[str, Any]:
+def invoke_bedrock_structured(
+    req: BedrockStructuredInvokeRequest,
+    principal: AuthenticatedPrincipal = Depends(enforce_rate_limit),
+) -> Dict[str, Any]:
     """Invokes Amazon Bedrock / AgentCore with deterministic structured output verification and retry."""
     state = {"calls": 0}
 
@@ -483,7 +544,10 @@ def invoke_bedrock_structured(req: BedrockStructuredInvokeRequest) -> Dict[str, 
 
 
 @app.get("/api/v1/adapters/bridges/{framework}")
-def get_framework_bridge(framework: str) -> Dict[str, Any]:
+def get_framework_bridge(
+    framework: str,
+    principal: AuthenticatedPrincipal = Depends(enforce_rate_limit),
+) -> Dict[str, Any]:
     """Exports top routed MCP tools into LangGraph, smolagents, or CrewAI schemas."""
     sample_tools = mcp_router.route_by_query(
         "Value Stream OKR management concerns, Snowflake Cortex Search, and PostgreSQL ledger", k=4
@@ -502,13 +566,18 @@ def get_framework_bridge(framework: str) -> Dict[str, Any]:
 
 
 @app.get("/api/v1/telemetry/summary")
-def get_telemetry_summary() -> Dict[str, Any]:
+def get_telemetry_summary(
+    principal: AuthenticatedPrincipal = Depends(enforce_rate_limit),
+) -> Dict[str, Any]:
     """Returns aggregated OpenTelemetry trace metrics, latency percentiles, and token budgets."""
     return telemetry_monitor.get_summary_metrics()
 
 
 @app.post("/api/v1/telemetry/span")
-def record_telemetry_span(req: TelemetrySpanRequest) -> Dict[str, Any]:
+def record_telemetry_span(
+    req: TelemetrySpanRequest,
+    principal: AuthenticatedPrincipal = Depends(enforce_rate_limit),
+) -> Dict[str, Any]:
     """Records an OpenTelemetry execution span and evaluates token budget thresholds."""
     span = telemetry_monitor.record_span(
         span_name=req.span_name,
@@ -523,8 +592,11 @@ def record_telemetry_span(req: TelemetrySpanRequest) -> Dict[str, Any]:
 
 
 @app.post("/api/v1/telemetry/runbook")
-def lookup_operational_runbook(req: RunbookLookupRequest) -> Dict[str, str]:
-    """Generates a standardized L2 operational runbook procedure for incident triage."""
+def lookup_operational_runbook(
+    req: RunbookLookupRequest,
+    principal: AuthenticatedPrincipal = Depends(enforce_rate_limit),
+) -> Dict[str, str]:
+    """Generates an operational runbook procedure for incident triage."""
     return telemetry_monitor.generate_runbook_entry(
         incident_type=req.incident_type,
         component=req.component,

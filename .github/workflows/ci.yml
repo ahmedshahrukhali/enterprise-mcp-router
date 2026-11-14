@@ -29,10 +29,14 @@ jobs:
       - name: Type-check with Mypy
         run: mypy --ignore-missing-imports src
       - name: Dependency vulnerability audit
-        run: pip-audit || true
+        run: pip-audit
       - name: Run Pytest suite with coverage
+        env:
+          ROUTER_DEV_MODE: "1"
         run: pytest --cov=src -v
       - name: Run CLI Benchmark Simulation
+        env:
+          ROUTER_DEV_MODE: "1"
         run: python run_demo.py
       - name: Build Docker image
         run: docker build -t enterprise-mcp-router:ci .

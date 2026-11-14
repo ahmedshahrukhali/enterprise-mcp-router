@@ -114,11 +114,13 @@ def test_stateful_hitl_interrupt_lifecycle():
     )
     assert denied["allowed"] is False
 
-    # Approve ticket
+    # Approve ticket via authorized reviewer in dedicated hitl_approvers group
     resolved = router.resolve_hitl_interrupt(
         ticket_id=ticket["ticket_id"],
         reviewer="approver@enterprise.io",
         decision="APPROVED",
+        reviewer_roles=["super_admin"],
+        reviewer_groups=["hitl_approvers"],
     )
     assert resolved["status"] == "APPROVED"
 

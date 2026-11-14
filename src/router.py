@@ -25,6 +25,10 @@ from src.connectors.data_connectors import (
     SnowflakeCortexConnector,
     ValueStreamManagementConnector,
 )
+from src.registry.bge_embeddings import (
+    DEFAULT_BGE_PROVIDER,
+    cosine_similarity as bge_cosine_similarity,
+)
 from src.registry.catalog import (
     OkapiBM25Index,
     compute_query_embedding,
@@ -134,8 +138,11 @@ class EnterpriseMCPRouter:
             tools = self._load_default_catalog_specs()
         self.tools: Dict[str, MCPToolSpec] = {t.name: t for t in tools}
         self.storage: BaseStateStore = storage or get_default_storage()
-        self.hitl_tickets: Dict[str, Dict[str, Any]] = {}
-        self.audit_trail: List[Dict[str, Any]] = []
+        # Hydrate persisted HITL tickets and recent audit events across restarts
+        self.hitl_tickets: Dict[str, Dict[str, Any]] = {
+            t["ticket_id"]: t for t in self.storage.list_tickets()
+        }
+        self.audit_trail: List[Dict[str, Any]] = list(reversed(self.storage.get_audit_trail(limit=500)))
         self.routing_feedback_stats: Dict[str, int] = {"total_feedback": 0, "hits": 0, "misses": 0}
         self.routing_misses_eval_queue: List[Dict[str, Any]] = []
         self._bm25_index = self._build_bm25_index()
@@ -192,17 +199,23 @@ class EnterpriseMCPRouter:
         domain_filter: Optional[str] = None,
         caller_roles: Optional[List[str]] = None,
         scoring_mode: str = "hybrid",
-        weights: Tuple[float, float, float] = (0.25, 0.65, 0.10),
+        weights: Optional[Tuple[float, float, float]] = None,
         auto_widen: bool = False,
     ) -> Dict[str, Any]:
         """
         Routes a natural language agent intent across the full 120+ tool registry,
-        combining 64-dim dense embedding cosine similarity with Okapi BM25 and
-        Reciprocal Rank Fusion (RRF), optionally filtered by caller RBAC role and
-        supporting automatic widen-k fallback when confidence at small k is ambiguous.
+        supporting 64-dim hashed embeddings, Okapi BM25, real 384-dim BAAI/bge-small-en-v1.5
+        dense vectors, and Reciprocal Rank Fusion (RRF), filtered by caller RBAC roles
+        with optional automatic widen-k fallback when top-5 confidence is ambiguous.
         """
         t0 = time.perf_counter()
+        use_bge = scoring_mode in ("bge_small_only", "hybrid_bge_bm25")
         q_emb = compute_query_embedding(query)
+        q_bge = DEFAULT_BGE_PROVIDER.embed_query(query) if use_bge else None
+
+        active_weights = weights
+        if active_weights is None:
+            active_weights = (0.45, 0.45, 0.10) if scoring_mode == "hybrid_bge_bm25" else (0.25, 0.65, 0.10)
 
         candidates: List[MCPToolSpec] = [
             spec
@@ -214,7 +227,15 @@ class EnterpriseMCPRouter:
         dense_scores: Dict[str, float] = {}
         bm25_scores: Dict[str, float] = {}
         for spec in candidates:
-            dense_scores[spec.name] = max(0.0, sum(q * t for q, t in zip(q_emb, spec.embedding)))
+            if use_bge and q_bge is not None:
+                t_bge = DEFAULT_BGE_PROVIDER.embed_tool(spec.name, spec.domain, spec.description)
+                dense_scores[spec.name] = (
+                    bge_cosine_similarity(q_bge, t_bge)
+                    if t_bge is not None
+                    else max(0.0, sum(q * t for q, t in zip(q_emb, spec.embedding)))
+                )
+            else:
+                dense_scores[spec.name] = max(0.0, sum(q * t for q, t in zip(q_emb, spec.embedding)))
             bm25_scores[spec.name] = self._bm25_index.score(query, spec.name)
 
         dense_order = sorted(candidates, key=lambda s: dense_scores[s.name], reverse=True)
@@ -222,13 +243,13 @@ class EnterpriseMCPRouter:
         dense_ranks = {spec.name: idx + 1 for idx, spec in enumerate(dense_order)}
         bm25_ranks = {spec.name: idx + 1 for idx, spec in enumerate(bm25_order)}
         max_rrf = 2.0 / 61.0
-        w_d, w_b, w_r = weights
+        w_d, w_b, w_r = active_weights
 
         scored_items: List[Tuple[float, float, float, MCPToolSpec]] = []
         for spec in candidates:
             d_score = dense_scores[spec.name]
             b_score = bm25_scores[spec.name]
-            if scoring_mode == "dense_only":
+            if scoring_mode in ("dense_only", "bge_small_only"):
                 raw_score = d_score
             elif scoring_mode == "bm25_only":
                 raw_score = b_score
@@ -345,6 +366,7 @@ class EnterpriseMCPRouter:
         arguments: Optional[Dict[str, Any]] = None,
         justification: str = "Agent requested execution of mutating enterprise tool.",
         ttl_seconds: int = 1800,
+        requester_groups: Optional[List[str]] = None,
     ) -> Dict[str, Any]:
         """Creates a stateful Human-in-the-Loop (HITL) approval interrupt ticket with TTL expiration."""
         spec = self.tools.get(tool_name)
@@ -365,6 +387,7 @@ class EnterpriseMCPRouter:
             "is_mutating": spec.is_mutating if spec else True,
             "requested_by": requested_by,
             "user_roles": user_roles,
+            "requester_groups": list(requester_groups or []),
             "arguments": normalized_args,
             "arguments_hash": arguments_hash,
             "justification": justification,
@@ -396,6 +419,7 @@ class EnterpriseMCPRouter:
         decision: str,
         notes: str = "",
         reviewer_roles: Optional[List[str]] = None,
+        reviewer_groups: Optional[List[str]] = None,
     ) -> Dict[str, Any]:
         """Approves or rejects a pending HITL interrupt ticket with separation-of-duties enforcement."""
         ticket = self.hitl_tickets.get(ticket_id)
@@ -410,11 +434,12 @@ class EnterpriseMCPRouter:
         if normalized_decision not in ("APPROVED", "REJECTED"):
             return {"status": "error", "reason": "invalid_hitl_decision", "ticket_id": ticket_id}
 
-        # Enforce HITL governance rules (no self-approval, no expired tickets, valid roles)
+        # Enforce HITL governance rules (no self-approval, no expired tickets, valid roles & approver group)
         ok, rule_err = HITLGovernanceRules.validate_resolution(
             ticket=ticket,
             reviewer=reviewer,
             reviewer_roles=reviewer_roles,
+            reviewer_groups=reviewer_groups,
         )
         if not ok:
             if rule_err == "hitl_ticket_expired":
@@ -642,32 +667,37 @@ class FastMCPServer:
         iics = self.connectors.get("informatica")
 
         if tool_name == "portfolio_vsm.detect_management_concerns" and vsm is not None:
-            return vsm.analyze_management_concerns(
+            res = vsm.analyze_management_concerns(
                 query=arguments.get("query", "Identify management concerns and recommend actions"),
                 portfolio_id=arguments.get("portfolio_id"),
                 router=self.router,
             )
+            return {**res, "execution_mode": "live_sqlite"}
         if tool_name == "portfolio_vsm.get_portfolio_health_summary" and vsm is not None:
-            return vsm.get_overview(portfolio_id=arguments.get("portfolio_id"))
+            res = vsm.get_overview(portfolio_id=arguments.get("portfolio_id"))
+            return {**res, "execution_mode": "live_sqlite"}
         if tool_name == "snowflake.execute_readonly_sql" and sf is not None:
-            return sf.validate_readonly_sql(
-                sql=arguments.get("sql", "SELECT 1"),
+            res = sf.validate_readonly_sql(
+                sql=arguments.get("sql", "SELECT fund_id, nav FROM PORTFOLIO_GOLD.FUNDS LIMIT 10"),
                 role=arguments.get("role", "ai_platform_reader"),
                 schema=arguments.get("schema_name", "PORTFOLIO_GOLD"),
             )
+            return {**res, "execution_mode": "sandbox_simulation"}
         if tool_name == "snowflake.cortex_search_docs" and sf is not None:
-            return sf.retrieve_cortex_rag(
+            res = sf.retrieve_cortex_rag(
                 query=arguments.get("query_or_id", "RRSP compliance"),
                 role=arguments.get("role", "ai_platform_reader"),
                 top_k=int(arguments.get("limit", 3)),
             )
+            return {**res, "execution_mode": "sandbox_simulation"}
         if tool_name == "postgres.read_accounting_ledger" and pg is not None:
-            return pg.query_ledger(
+            res = pg.query_ledger(
                 sql="SELECT account_id, portfolio_name, balance_usd, risk_tier FROM accounts ORDER BY balance_usd DESC",
                 role="analyst",
             )
+            return {**res, "execution_mode": "live_sqlite"}
         if tool_name == "informatica.validate_taskflow_sla" and iics is not None:
-            return iics.validate_taskflow_run(
+            res = iics.validate_taskflow_run(
                 {
                     "taskflow_name": arguments.get("query_or_id", "tf_snowflake_fund_docs_elt"),
                     "status": "SUCCESS",
@@ -675,6 +705,63 @@ class FastMCPServer:
                     "freshness_lag_minutes": 8,
                 }
             )
+            return {**res, "execution_mode": "sandbox_simulation"}
+
+        domain = tool_name.split(".", 1)[0] if "." in tool_name else "enterprise"
+        if domain == "devops":
+            return {
+                "tool": tool_name,
+                "domain": domain,
+                "status": "executed",
+                "execution_mode": "sandbox_simulation",
+                "sandbox_telemetry": {
+                    "repository": arguments.get("query_or_id", "enterprise-mcp-router"),
+                    "critical_cves_open": 1,
+                    "argocd_sync_state": "Synced",
+                    "ci_workflow_status": "passing",
+                },
+                "arguments_received": arguments,
+            }
+        if domain == "supply_chain":
+            return {
+                "tool": tool_name,
+                "domain": domain,
+                "status": "executed",
+                "execution_mode": "sandbox_simulation",
+                "sandbox_telemetry": {
+                    "target_sku_or_site": arguments.get("query_or_id", "SKU-4402"),
+                    "gating_components": ["COMP-TX-900", "SUB-PWR-14"],
+                    "projected_fill_rate_pct": 94.2,
+                },
+                "arguments_received": arguments,
+            }
+        if domain == "crm_rest":
+            return {
+                "tool": tool_name,
+                "domain": domain,
+                "status": "executed",
+                "execution_mode": "sandbox_simulation",
+                "sandbox_telemetry": {
+                    "client_ref": arguments.get("query_or_id", "CLI-MASKED-7812"),
+                    "pii_redaction_active": True,
+                    "rest_circuit_breaker": "CLOSED",
+                },
+                "arguments_received": arguments,
+            }
+        if domain == "knowledge_graph":
+            return {
+                "tool": tool_name,
+                "domain": domain,
+                "status": "executed",
+                "execution_mode": "sandbox_simulation",
+                "sandbox_telemetry": {
+                    "collection": "enterprise_policies_v2",
+                    "vector_dimension": 384,
+                    "graph_hop_depth": 2,
+                    "mrr_estimate": 0.91,
+                },
+                "arguments_received": arguments,
+            }
         return None
 
     def handle_jsonrpc(
@@ -818,9 +905,12 @@ class FastMCPServer:
                 if builtin_out is not None:
                     out = builtin_out
                 else:
+                    spec = self.router.tools.get(tool_name)
                     out = {
                         "tool": tool_name,
+                        "domain": spec.domain if spec else "unknown",
                         "status": "executed",
+                        "execution_mode": "sandbox_simulation",
                         "schema_validated": True,
                         "governance": auth,
                         "arguments_received": arguments,

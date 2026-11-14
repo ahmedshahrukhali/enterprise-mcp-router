@@ -1,6 +1,6 @@
 """
-Enterprise Authentication (HS256 JWT + API Key), RBAC Role Hierarchy,
-Separation-of-Duties & Argument-Hash-Bound HITL Governance, and Rate Limiting.
+Authentication (HS256 + RS256/JWKS JWT, API Key), RBAC Role Hierarchy,
+Separation-of-Duties & Approver-Group HITL Governance, and Rate Limiting.
 """
 
 import base64
@@ -8,12 +8,41 @@ import hashlib
 import hmac
 import json
 import os
+import secrets
 import threading
 import time
 from collections import deque
 from typing import Any, Deque, Dict, List, Optional, Set, Tuple
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import padding, rsa
 from fastapi import Depends, Header, HTTPException
 from pydantic import BaseModel, Field
+
+_EPHEMERAL_DEV_SECRET = secrets.token_hex(32)
+
+
+def is_dev_mode() -> bool:
+    """Returns True only when explicit local development mode is opted into."""
+    return os.environ.get("ROUTER_DEV_MODE", "").lower() in ("1", "true", "yes")
+
+
+def validate_security_config() -> None:
+    """
+    Fail-closed startup check: requires an explicit signing/verification key
+    (ROUTER_JWT_SECRET, ROUTER_JWT_PUBLIC_KEY_PEM, or ROUTER_JWKS_JSON)
+    unless ROUTER_DEV_MODE=1 is set.
+    """
+    if is_dev_mode():
+        return
+    has_key = any(
+        bool(os.environ.get(var, "").strip())
+        for var in ("ROUTER_JWT_SECRET", "ROUTER_JWT_PUBLIC_KEY_PEM", "ROUTER_JWKS_JSON")
+    )
+    if not has_key:
+        raise RuntimeError(
+            "Refusing to start without ROUTER_JWT_SECRET, ROUTER_JWT_PUBLIC_KEY_PEM, "
+            "or ROUTER_JWKS_JSON (set ROUTER_DEV_MODE=1 only for local development)."
+        )
 
 
 ROLE_HIERARCHY: Dict[str, Set[str]] = {
@@ -64,8 +93,18 @@ def is_role_authorized(required_role: str, user_roles: Optional[List[str]]) -> b
     return required_role in expand_allowed_roles(user_roles)
 
 
-def _get_jwt_secret() -> str:
-    return os.environ.get("ROUTER_JWT_SECRET", "dev-insecure-change-in-prod-enterprise-mcp-router-key")
+def _get_jwt_secret(allow_missing: bool = False) -> Optional[str]:
+    configured = os.environ.get("ROUTER_JWT_SECRET", "").strip()
+    if configured:
+        return configured
+    if is_dev_mode():
+        return _EPHEMERAL_DEV_SECRET
+    if allow_missing:
+        return None
+    raise RuntimeError(
+        "ROUTER_JWT_SECRET is required for HS256 signing/verification "
+        "(or enable ROUTER_DEV_MODE=1 for local dev)."
+    )
 
 
 def _b64url_encode(raw: bytes) -> str:
@@ -73,8 +112,46 @@ def _b64url_encode(raw: bytes) -> str:
 
 
 def _b64url_decode(data: str) -> bytes:
-    padding = "=" * (-len(data) % 4)
-    return base64.urlsafe_b64decode((data + padding).encode("ascii"))
+    padding_str = "=" * (-len(data) % 4)
+    return base64.urlsafe_b64decode((data + padding_str).encode("ascii"))
+
+
+def _int_to_b64url(val: int) -> str:
+    byte_len = max(1, (val.bit_length() + 7) // 8)
+    return _b64url_encode(val.to_bytes(byte_len, "big"))
+
+
+def _b64url_to_int(val: str) -> int:
+    return int.from_bytes(_b64url_decode(val), "big")
+
+
+def generate_rsa_keypair_and_jwks(kid: str = "idp-rsa-1") -> Dict[str, Any]:
+    """Generates an RSA-2048 keypair and corresponding OIDC JWKS document for RS256 verification."""
+    private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    public_key = private_key.public_key()
+    private_pem = private_key.private_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PrivateFormat.PKCS8,
+        encryption_algorithm=serialization.NoEncryption(),
+    ).decode("utf-8")
+    public_pem = public_key.public_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PublicFormat.SubjectPublicKeyInfo,
+    ).decode("utf-8")
+    numbers = public_key.public_numbers()
+    jwk = {
+        "kty": "RSA",
+        "use": "sig",
+        "alg": "RS256",
+        "kid": kid,
+        "n": _int_to_b64url(numbers.n),
+        "e": _int_to_b64url(numbers.e),
+    }
+    return {
+        "private_pem": private_pem,
+        "public_pem": public_pem,
+        "jwks": {"keys": [jwk]},
+    }
 
 
 def create_jwt_token(
@@ -82,17 +159,25 @@ def create_jwt_token(
     roles: List[str],
     expires_in_seconds: int = 3600,
     secret: Optional[str] = None,
+    groups: Optional[List[str]] = None,
+    issuer: Optional[str] = None,
+    audience: Optional[str] = None,
 ) -> str:
-    """Mints an RFC 7519 HS256 JWT bearing verified subject and RBAC roles."""
-    signing_secret = (secret or _get_jwt_secret()).encode("utf-8")
+    """Mints an RFC 7519 HS256 JWT bearing subject, RBAC roles, groups, iss, and aud."""
+    resolved_secret = secret if secret is not None else _get_jwt_secret()
+    if not resolved_secret:
+        raise RuntimeError("ROUTER_JWT_SECRET is required")
+    signing_secret = resolved_secret.encode("utf-8")
     now = int(time.time())
     header = {"alg": "HS256", "typ": "JWT"}
     payload = {
         "sub": username,
         "roles": list(roles),
+        "groups": list(groups or []),
         "iat": now,
         "exp": now + expires_in_seconds,
-        "iss": "enterprise-mcp-router",
+        "iss": issuer or os.environ.get("ROUTER_JWT_ISSUER", "enterprise-mcp-router"),
+        "aud": audience or os.environ.get("ROUTER_JWT_AUDIENCE", "enterprise-mcp-gateway"),
     }
     header_b64 = _b64url_encode(json.dumps(header, separators=(",", ":")).encode("utf-8"))
     payload_b64 = _b64url_encode(json.dumps(payload, separators=(",", ":")).encode("utf-8"))
@@ -101,22 +186,98 @@ def create_jwt_token(
     return f"{header_b64}.{payload_b64}.{_b64url_encode(sig)}"
 
 
-def verify_jwt_token(token: str, secret: Optional[str] = None) -> Dict[str, Any]:
-    """Verifies an HS256 JWT signature and expiration claim."""
+def create_rs256_jwt_token(
+    username: str,
+    roles: List[str],
+    private_pem: str,
+    expires_in_seconds: int = 3600,
+    groups: Optional[List[str]] = None,
+    kid: str = "idp-rsa-1",
+    issuer: Optional[str] = None,
+    audience: Optional[str] = None,
+) -> str:
+    """Mints an RS256 OIDC JWT signed by an RSA private key."""
+    private_key = serialization.load_pem_private_key(private_pem.encode("utf-8"), password=None)
+    now = int(time.time())
+    header = {"alg": "RS256", "typ": "JWT", "kid": kid}
+    payload = {
+        "sub": username,
+        "roles": list(roles),
+        "groups": list(groups or []),
+        "iat": now,
+        "exp": now + expires_in_seconds,
+        "iss": issuer or os.environ.get("ROUTER_JWT_ISSUER", "enterprise-mcp-router"),
+        "aud": audience or os.environ.get("ROUTER_JWT_AUDIENCE", "enterprise-mcp-gateway"),
+    }
+    header_b64 = _b64url_encode(json.dumps(header, separators=(",", ":")).encode("utf-8"))
+    payload_b64 = _b64url_encode(json.dumps(payload, separators=(",", ":")).encode("utf-8"))
+    signing_input = f"{header_b64}.{payload_b64}".encode("ascii")
+    sig = private_key.sign(signing_input, padding.PKCS1v15(), hashes.SHA256())  # type: ignore[union-attr]
+    return f"{header_b64}.{payload_b64}.{_b64url_encode(sig)}"
+
+
+def _load_rsa_public_key_for_token(
+    header: Dict[str, Any],
+    public_key_pem: Optional[str],
+    jwks: Optional[Dict[str, Any]],
+) -> Any:
+    pem = public_key_pem or os.environ.get("ROUTER_JWT_PUBLIC_KEY_PEM", "").strip()
+    if pem:
+        return serialization.load_pem_public_key(pem.encode("utf-8"))
+
+    jwks_doc = jwks
+    if jwks_doc is None:
+        env_jwks = os.environ.get("ROUTER_JWKS_JSON", "").strip()
+        if env_jwks:
+            jwks_doc = json.loads(env_jwks)
+
+    if isinstance(jwks_doc, dict):
+        keys = jwks_doc.get("keys", [])
+        kid = header.get("kid")
+        matched = [k for k in keys if (not kid or k.get("kid") == kid) and k.get("kty") == "RSA"]
+        if matched:
+            jwk = matched[0]
+            pub_numbers = rsa.RSAPublicNumbers(_b64url_to_int(jwk["e"]), _b64url_to_int(jwk["n"]))
+            return pub_numbers.public_key()
+
+    raise ValueError("rs256_public_key_not_configured")
+
+
+def verify_jwt_token(
+    token: str,
+    secret: Optional[str] = None,
+    public_key_pem: Optional[str] = None,
+    jwks: Optional[Dict[str, Any]] = None,
+    expected_issuer: Optional[str] = None,
+    expected_audience: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Verifies an HS256 or RS256/JWKS JWT signature, expiration, subject, iss, and aud."""
     parts = token.split(".")
     if len(parts) != 3:
         raise ValueError("malformed_jwt")
     header_b64, payload_b64, sig_b64 = parts
-    signing_secret = (secret or _get_jwt_secret()).encode("utf-8")
 
     try:
         header = json.loads(_b64url_decode(header_b64).decode("utf-8"))
-        if header.get("alg") != "HS256":
-            raise ValueError("unsupported_jwt_alg")
+        alg = header.get("alg")
         signing_input = f"{header_b64}.{payload_b64}".encode("ascii")
-        expected_sig = _b64url_encode(hmac.new(signing_secret, signing_input, hashlib.sha256).digest())
-        if not hmac.compare_digest(expected_sig, sig_b64):
-            raise ValueError("invalid_jwt_signature")
+
+        if alg == "HS256":
+            hs_secret = secret if secret is not None else _get_jwt_secret(allow_missing=True)
+            if not hs_secret:
+                raise ValueError("hs256_secret_not_configured")
+            expected_sig = _b64url_encode(hmac.new(hs_secret.encode("utf-8"), signing_input, hashlib.sha256).digest())
+            if not hmac.compare_digest(expected_sig, sig_b64):
+                raise ValueError("invalid_jwt_signature")
+        elif alg == "RS256":
+            pub_key = _load_rsa_public_key_for_token(header, public_key_pem, jwks)
+            try:
+                pub_key.verify(_b64url_decode(sig_b64), signing_input, padding.PKCS1v15(), hashes.SHA256())
+            except Exception as exc:
+                raise ValueError("invalid_jwt_signature") from exc
+        else:
+            raise ValueError("unsupported_jwt_alg")
+
         claims = json.loads(_b64url_decode(payload_b64).decode("utf-8"))
     except ValueError:
         raise
@@ -128,12 +289,27 @@ def verify_jwt_token(token: str, secret: Optional[str] = None) -> Dict[str, Any]
         raise ValueError("expired_jwt")
     if not claims.get("sub"):
         raise ValueError("missing_jwt_subject")
+
+    req_iss = expected_issuer or os.environ.get("ROUTER_JWT_ISSUER", "enterprise-mcp-router")
+    if claims.get("iss") != req_iss:
+        raise ValueError("invalid_jwt_issuer")
+
+    req_aud = expected_audience or os.environ.get("ROUTER_JWT_AUDIENCE", "enterprise-mcp-gateway")
+    aud_claim = claims.get("aud")
+    if isinstance(aud_claim, list):
+        aud_valid = req_aud in aud_claim
+    else:
+        aud_valid = aud_claim == req_aud
+    if not aud_valid:
+        raise ValueError("invalid_jwt_audience")
+
     return claims
 
 
 class AuthenticatedPrincipal(BaseModel):
     username: str
     roles: List[str] = Field(default_factory=list)
+    groups: List[str] = Field(default_factory=list)
     is_authenticated: bool = True
     auth_scheme: str = "jwt"
 
@@ -141,48 +317,58 @@ class AuthenticatedPrincipal(BaseModel):
         return is_role_authorized(required_role, self.roles)
 
 
-# Standard enterprise pre-configured principals
+# Development-only demo API keys (disabled by default unless ROUTER_DEV_MODE=1 or ROUTER_ENABLE_DEMO_KEYS=1).
+# Notice operators (`ak-admin-demo`) belong to `platform_operators`, while the designated
+# peer approver (`ak-superadmin-demo`) belongs strictly to `hitl_approvers`.
 DEFAULT_PRINCIPALS: Dict[str, AuthenticatedPrincipal] = {
     "ak-analyst-demo": AuthenticatedPrincipal(
         username="analyst_user",
         roles=["analyst"],
+        groups=["platform_operators"],
         auth_scheme="api_key",
     ),
     "ak-engineer-demo": AuthenticatedPrincipal(
         username="data_engineer_user",
         roles=["data_engineer", "analyst"],
+        groups=["platform_operators"],
         auth_scheme="api_key",
     ),
     "ak-admin-demo": AuthenticatedPrincipal(
         username="platform_admin_user",
         roles=["platform_admin", "analyst", "data_engineer"],
+        groups=["platform_operators"],
         auth_scheme="api_key",
     ),
     "ak-superadmin-demo": AuthenticatedPrincipal(
-        username="super_admin_user",
-        roles=["super_admin", "platform_admin", "compliance_officer", "data_engineer", "analyst"],
+        username="sr_ops_approver@enterprise.io",
+        roles=["super_admin", "compliance_officer"],
+        groups=["hitl_approvers"],
         auth_scheme="api_key",
     ),
 }
 
 
 def get_configured_principals() -> Dict[str, AuthenticatedPrincipal]:
-    """Loads principals from env JSON or default demo table."""
+    """Loads API key principals from ROUTER_API_KEYS env; demo keys only in dev mode."""
+    principals: Dict[str, AuthenticatedPrincipal] = {}
+    demo_keys_enabled = is_dev_mode() or os.environ.get("ROUTER_ENABLE_DEMO_KEYS", "").lower() in ("1", "true", "yes")
+    if demo_keys_enabled:
+        principals.update(DEFAULT_PRINCIPALS)
+
     env_keys = os.environ.get("ROUTER_API_KEYS")
     if env_keys:
         try:
             custom_map = json.loads(env_keys)
-            principals = dict(DEFAULT_PRINCIPALS)
             for k, v in custom_map.items():
                 principals[k] = AuthenticatedPrincipal(
                     username=v.get("username", "custom_user"),
                     roles=v.get("roles", ["analyst"]),
+                    groups=v.get("groups", []),
                     auth_scheme="api_key",
                 )
-            return principals
         except Exception:
-            return DEFAULT_PRINCIPALS
-    return DEFAULT_PRINCIPALS
+            pass
+    return principals
 
 
 def extract_token_from_headers(
@@ -205,9 +391,9 @@ def get_current_principal(
     authorization: Optional[str] = Header(None, alias="Authorization"),
 ) -> AuthenticatedPrincipal:
     """
-    FastAPI dependency to authenticate caller via signed HS256 JWT or API key.
-    Unauthenticated requests are rejected with 401 when ROUTER_REQUIRE_AUTH=true,
-    or scoped strictly to read-only guest permissions when demo mode is active.
+    FastAPI dependency verifying caller identity via HS256/RS256 JWT or configured API key.
+    Fails closed (401) by default when unauthenticated unless ROUTER_DEV_MODE=1 is set
+    and ROUTER_REQUIRE_AUTH is not enabled.
     """
     token = extract_token_from_headers(x_api_key, authorization)
     principals = get_configured_principals()
@@ -225,6 +411,7 @@ def get_current_principal(
             return AuthenticatedPrincipal(
                 username=str(claims["sub"]),
                 roles=[str(r) for r in claims.get("roles", ["analyst"])],
+                groups=[str(g) for g in claims.get("groups", [])],
                 is_authenticated=True,
                 auth_scheme="jwt",
             )
@@ -237,17 +424,18 @@ def get_current_principal(
         )
 
     require_auth = os.environ.get("ROUTER_REQUIRE_AUTH", "false").lower() in ("true", "1", "yes")
-    if require_auth:
+    if not is_dev_mode() or require_auth:
         raise HTTPException(
             status_code=401,
             detail="authentication_required",
             headers={"WWW-Authenticate": "Bearer"},
         )
 
-    # Unauthenticated demo callers never receive privileged or mutating roles
+    # Unauthenticated local dev callers only receive read-only discovery permissions
     return AuthenticatedPrincipal(
         username="anonymous_reader",
         roles=["analyst", "ai_platform_reader"],
+        groups=[],
         is_authenticated=False,
         auth_scheme="anonymous_readonly",
     )
@@ -295,7 +483,8 @@ def enforce_rate_limit(
 class HITLGovernanceRules:
     """Security rules governing Human-in-the-Loop approval workflows."""
 
-    ALLOWED_APPROVER_ROLES: Set[str] = {"platform_admin", "super_admin"}
+    ALLOWED_APPROVER_ROLES: Set[str] = {"super_admin", "platform_admin", "compliance_officer", "hitl_approver"}
+    REQUIRED_APPROVER_GROUP: str = "hitl_approvers"
 
     @staticmethod
     def compute_arguments_hash(tool_name: str, arguments: Optional[Dict[str, Any]] = None) -> str:
@@ -313,14 +502,17 @@ class HITLGovernanceRules:
         ticket: Dict[str, Any],
         reviewer: str,
         reviewer_roles: Optional[List[str]] = None,
+        reviewer_groups: Optional[List[str]] = None,
     ) -> Tuple[bool, Optional[str]]:
         """
         Validates whether a reviewer is allowed to approve/reject a ticket.
-        Enforces separation of duties (no self-approval) and approver role hierarchy.
+        Enforces separation of duties (no self-approval), approver role check,
+        and mandatory membership in a dedicated approver group (`hitl_approvers`)
+        so peer operator sock-puppet accounts cannot approve each other's tickets.
         """
         # 1. Separation of duties check
         requested_by = ticket.get("requested_by")
-        if requested_by and reviewer == requested_by:
+        if not reviewer or (requested_by and reviewer == requested_by):
             return False, "self_approval_prohibited"
 
         # 2. Expiration check
@@ -332,10 +524,13 @@ class HITLGovernanceRules:
         if ticket.get("status") != "PENDING_APPROVAL":
             return False, f"ticket_already_resolved:{ticket.get('status')}"
 
-        # 4. Approver role check (if reviewer_roles provided)
-        if reviewer_roles is not None:
-            if not any(r in cls.ALLOWED_APPROVER_ROLES for r in reviewer_roles):
-                return False, "reviewer_not_authorized"
+        # 4. Approver role check (fail closed when roles missing)
+        if not reviewer_roles or not any(r in cls.ALLOWED_APPROVER_ROLES for r in reviewer_roles):
+            return False, "reviewer_not_authorized"
+
+        # 5. Dedicated approver group check (prevents operator/admin sock-puppet approvals)
+        if not reviewer_groups or cls.REQUIRED_APPROVER_GROUP not in reviewer_groups:
+            return False, "reviewer_missing_approver_group"
 
         return True, None
 

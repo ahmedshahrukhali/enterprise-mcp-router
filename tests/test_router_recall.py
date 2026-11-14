@@ -82,7 +82,14 @@ def test_router_recall_across_all_domains():
     assert top3_acc >= 95.0, f"Top-3 recall {top3_acc:.1f}% fell below 95%"
 
 
-from src.registry.eval_dataset import FULL_EVAL_DATASET, run_full_routing_benchmark
+from src.registry.eval_dataset import (
+    FULL_EVAL_DATASET,
+    HELDOUT_EVAL_DATASET,
+    HELDOUT_PARAPHRASED_EVAL_DATASET,
+    HELDOUT_STANDARD_EVAL_DATASET,
+    TRAIN_EVAL_DATASET,
+    run_full_routing_benchmark,
+)
 
 
 def test_false_positive_resistance():
@@ -97,31 +104,37 @@ def test_false_positive_resistance():
     assert "devops" != routed_domains[0], f"Spurious match: 'decision'/'enterprise' routed to devops: {routed_domains}"
 
 
-def test_honest_160_query_eval_benchmark_and_ablations():
-    """Runs the full 160-query benchmark (120 single-domain + 40 cross-domain) and ablations."""
+def test_honest_200_query_heldout_benchmark_and_bge_ablations():
+    """Runs 200-query split benchmark (96 train, 64 std held-out, 40 paraphrased held-out) incl. BGE-small-en-v1.5."""
     router = EnterpriseMCPRouter.from_enterprise_catalog()
-    assert len(FULL_EVAL_DATASET) == 160
+    assert len(FULL_EVAL_DATASET) == 200
+    assert len(TRAIN_EVAL_DATASET) == 96
+    assert len(HELDOUT_STANDARD_EVAL_DATASET) == 64
+    assert len(HELDOUT_PARAPHRASED_EVAL_DATASET) == 40
+    assert len(HELDOUT_EVAL_DATASET) == 104
 
     report = run_full_routing_benchmark(router)
-    assert report["dataset_size"] == 160
-    assert report["single_domain_count"] == 120
-    assert report["cross_domain_count"] == 40
+    assert report["dataset_size"] == 200
+    assert report["train_count"] == 96
+    assert report["heldout_test_count"] == 104
     assert report["total_registered_tools"] == 120
     assert report["total_serialized_schema_tokens"] > 25000
 
     abl = report["ablations"]
     assert "dense_only_hash64" in abl
     assert "bm25_only" in abl
-    assert "hybrid_default_55_35_10" in abl
-    assert "hybrid_balanced_25_65_10" in abl
-    assert "hybrid_widen_k5_fallback" in abl
+    assert "bge_small_only" in abl
+    assert "hybrid_bge_bm25_45_45_10" in abl
+    assert "hybrid_bge_widen_k5_fallback" in abl
 
-    tuned = abl["hybrid_balanced_25_65_10"]
-    assert tuned["overall"]["recall@5"] >= 0.95
-    assert tuned["single_domain"]["recall@5"] >= 0.97
-    assert tuned["cross_domain"]["recall@5"] >= 0.90
-    assert tuned["overall"]["recall@25"] >= 0.99
+    # Honest conclusion: hash64 adds nothing over BM25 on standard queries
     assert abl["bm25_only"]["overall"]["recall@5"] > abl["dense_only_hash64"]["overall"]["recall@5"]
+
+    # Real BGE-small-en-v1.5 outperforms BM25 and hash64 on held-out zero-overlap paraphrased queries
+    para = report["ablations_by_split"]["heldout_paraphrased_40"]
+    assert para["bge_small_only"]["overall"]["recall@5"] > para["bm25_only"]["overall"]["recall@5"]
+    assert para["hybrid_bge_bm25_45_45_10"]["overall"]["recall@5"] > para["dense_only_hash64"]["overall"]["recall@5"]
+    assert abl["hybrid_bge_widen_k5_fallback"]["overall"]["recall@5"] >= 0.90
 
 
 def test_role_filtered_routing_and_miss_feedback():

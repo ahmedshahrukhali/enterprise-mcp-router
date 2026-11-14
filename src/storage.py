@@ -414,16 +414,16 @@ _GLOBAL_STORE: Optional[BaseStateStore] = None
 
 
 def get_default_storage(db_path: Optional[str] = None) -> BaseStateStore:
-    """Returns or initializes the global storage backend."""
+    """Returns or initializes the global storage backend (defaults to SQLite WAL persistence)."""
     global _GLOBAL_STORE
     if _GLOBAL_STORE is None:
-        # Check environment variable for SQLite persistence or fallback to InMemory
+        backend = os.environ.get("ROUTER_STORAGE_BACKEND", "sqlite").lower().strip()
         sqlite_env = os.environ.get("ROUTER_SQLITE_PATH")
-        if sqlite_env or db_path:
+        if backend == "memory" and not db_path and not sqlite_env:
+            _GLOBAL_STORE = InMemoryStateStore()
+        else:
             target = db_path or sqlite_env or "enterprise_router.db"
             _GLOBAL_STORE = SQLiteStateStore(target)
-        else:
-            _GLOBAL_STORE = InMemoryStateStore()
     return _GLOBAL_STORE
 
 

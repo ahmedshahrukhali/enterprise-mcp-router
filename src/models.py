@@ -29,7 +29,7 @@ class SemanticRouteRequest(BaseModel):
     domain_filter: Optional[str] = Field(default=None, description="Optional enterprise namespace filter")
     scoring_mode: str = Field(
         default="hybrid",
-        pattern="^(hybrid|dense_only|bm25_only)$",
+        pattern="^(hybrid|dense_only|bm25_only|bge_small_only|hybrid_bge_bm25)$",
         description="Scorer blend mode for routing evaluation",
     )
     auto_widen: bool = Field(
@@ -92,8 +92,8 @@ class AuthTokenRequest(BaseModel):
     username: str = Field(default="demo_operator@enterprise.io", min_length=2, max_length=120)
     role: str = Field(
         default="analyst",
-        pattern="^(ai_platform_reader|analyst|data_engineer|compliance_officer|platform_admin|super_admin)$",
-        description="Verified session persona role for HS256 JWT minting",
+        pattern="^(ai_platform_reader|analyst|data_engineer|compliance_officer|platform_admin)$",
+        description="Dev-only session persona role for HS256 JWT minting (cannot mint super_admin or hitl_approvers)",
     )
 
 

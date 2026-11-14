@@ -7,21 +7,31 @@ Verifies:
 4. API Key authentication and RBAC role derivation
 """
 
+import json
 import os
 import sqlite3
 import tempfile
 import time
+import pytest
 from fastapi.testclient import TestClient
 
+from src.connectors.data_connectors import (
+    PostgresEnterpriseConnector,
+    SnowflakeCortexConnector,
+    ValueStreamManagementConnector,
+)
 from src.connectors.sql_guard import SafeSQLValidator
-from src.main import app
+from src.main import app, mcp_router
 from src.router import EnterpriseMCPRouter
 from src.security import (
     DEFAULT_RATE_LIMITER,
     create_jwt_token,
+    create_rs256_jwt_token,
+    generate_rsa_keypair_and_jwks,
+    validate_security_config,
     verify_jwt_token,
 )
-from src.storage import SQLiteStateStore
+from src.storage import SQLiteStateStore, get_default_storage, reset_default_storage
 
 client = TestClient(app)
 
@@ -121,12 +131,24 @@ def test_hitl_self_approval_and_role_enforcement():
     assert unauthorized_approve["status"] == "error"
     assert unauthorized_approve["reason"] == "reviewer_not_authorized"
 
-    # 3. Legitimate authorized reviewer can approve
+    # 3. Same-group operator without hitl_approvers group is blocked (defeats sock-puppet)
+    missing_group = router.resolve_hitl_interrupt(
+        ticket_id=ticket_id,
+        reviewer="sock_puppet_admin",
+        decision="APPROVED",
+        reviewer_roles=["super_admin", "platform_admin"],
+        reviewer_groups=["platform_operators"],
+    )
+    assert missing_group["status"] == "error"
+    assert missing_group["reason"] == "reviewer_missing_approver_group"
+
+    # 4. Legitimate authorized reviewer in dedicated hitl_approvers group can approve
     valid_approve = router.resolve_hitl_interrupt(
         ticket_id=ticket_id,
         reviewer="bob_security_lead",
         decision="APPROVED",
         reviewer_roles=["platform_admin"],
+        reviewer_groups=["hitl_approvers"],
     )
     assert valid_approve["status"] == "APPROVED"
 
@@ -161,6 +183,7 @@ def test_hitl_ticket_expiration_and_replay_prevention():
         reviewer="approver_y",
         decision="APPROVED",
         reviewer_roles=["platform_admin"],
+        reviewer_groups=["hitl_approvers"],
     )
 
     # First authorization consumes the ticket
@@ -225,8 +248,15 @@ def test_sqlite_persistence_across_reloads():
             tool_name="postgres.execute_outbound_wire",
             requested_by="persisted_agent",
             user_roles=["platform_admin"],
+            requester_groups=["platform_operators"],
         )
-        router1.resolve_hitl_interrupt(t["ticket_id"], reviewer="lead_reviewer", decision="APPROVED")
+        router1.resolve_hitl_interrupt(
+            t["ticket_id"],
+            reviewer="lead_reviewer",
+            decision="APPROVED",
+            reviewer_roles=["platform_admin"],
+            reviewer_groups=["hitl_approvers"],
+        )
         assert store1.verify_audit_chain()["valid"] is True
         store1.close()
         store1 = None
@@ -238,6 +268,8 @@ def test_sqlite_persistence_across_reloads():
         assert loaded_ticket is not None
         assert loaded_ticket["status"] == "APPROVED"
         assert loaded_ticket["reviewer"] == "lead_reviewer"
+        assert router2.hitl_tickets[t["ticket_id"]]["status"] == "APPROVED"
+        assert len(router2.audit_trail) >= 2
         assert store2.verify_audit_chain()["valid"] is True
 
         # Verify SQLite append-only triggers reject UPDATE and DELETE on audit_events
@@ -268,9 +300,24 @@ def test_sqlite_persistence_across_reloads():
 
 def test_phase0_bypass_regression_suite(monkeypatch):
     # 1. Mint HS256 JWT tokens for requester and peer reviewer
-    requester_jwt = create_jwt_token("wire_agent_01", ["platform_admin"], expires_in_seconds=600)
-    reviewer_jwt = create_jwt_token("sr_ops_approver", ["super_admin"], expires_in_seconds=600)
-    expired_jwt = create_jwt_token("wire_agent_01", ["platform_admin"], expires_in_seconds=-10)
+    requester_jwt = create_jwt_token(
+        "wire_agent_01",
+        ["platform_admin"],
+        expires_in_seconds=600,
+        groups=["platform_operators"],
+    )
+    reviewer_jwt = create_jwt_token(
+        "sr_ops_approver",
+        ["super_admin"],
+        expires_in_seconds=600,
+        groups=["hitl_approvers"],
+    )
+    expired_jwt = create_jwt_token(
+        "wire_agent_01",
+        ["platform_admin"],
+        expires_in_seconds=-10,
+        groups=["platform_operators"],
+    )
 
     claims = verify_jwt_token(requester_jwt)
     assert claims["sub"] == "wire_agent_01"
@@ -407,7 +454,11 @@ def test_phase0_bypass_regression_suite(monkeypatch):
     try:
         DEFAULT_RATE_LIMITER.reset()
         monkeypatch.setenv("ROUTER_RATE_LIMIT_RPM", "2")
-        rl_hdr = {"Authorization": f"Bearer {create_jwt_token('rate_probe', ['analyst'], 60)}"}
+        rl_hdr = {
+            "Authorization": (
+                f"Bearer {create_jwt_token('rate_probe', ['analyst'], expires_in_seconds=60, groups=['platform_operators'])}"
+            )
+        }
         assert client.post("/api/v1/router/search", headers=rl_hdr, json={"query": "NAV"}).status_code == 200
         assert client.post("/api/v1/router/search", headers=rl_hdr, json={"query": "NAV"}).status_code == 200
         blocked_429 = client.post("/api/v1/router/search", headers=rl_hdr, json={"query": "NAV"})
@@ -477,3 +528,308 @@ def test_sql_guard_adversarial_payload_suite():
             schema="PORTFOLIO_GOLD",
         )
         assert res["valid"] is True, f"Safe SQL was falsely blocked ({label}): {res}"
+
+
+def test_identity_fail_closed_startup_and_disabled_demo_keys(monkeypatch):
+    monkeypatch.delenv("ROUTER_DEV_MODE", raising=False)
+    monkeypatch.delenv("ROUTER_JWT_SECRET", raising=False)
+    monkeypatch.delenv("ROUTER_JWT_PUBLIC_KEY_PEM", raising=False)
+    monkeypatch.delenv("ROUTER_JWKS_JSON", raising=False)
+
+    with pytest.raises(RuntimeError):
+        validate_security_config()
+
+    with pytest.raises(RuntimeError):
+        with TestClient(app):
+            pass
+
+    monkeypatch.setenv("ROUTER_JWT_SECRET", "prod-test-secret-key-at-least-32-bytes-long")
+    with TestClient(app) as client:
+        assert client.post("/api/v1/router/search", json={"query": "snowflake"}).status_code == 401
+        assert client.get("/api/v1/governance/audit-verify").status_code == 401
+        assert (
+            client.post(
+                "/mcp/jsonrpc",
+                json={"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}},
+            ).status_code
+            == 401
+        )
+        assert (
+            client.post(
+                "/api/v1/router/search",
+                headers={"X-API-Key": "ak-superadmin-demo"},
+                json={"query": "snowflake"},
+            ).status_code
+            == 401
+        )
+        assert (
+            client.post(
+                "/api/v1/router/search",
+                headers={"X-API-Key": "ak-admin-demo"},
+                json={"query": "snowflake"},
+            ).status_code
+            == 401
+        )
+        assert (
+            client.post(
+                "/api/v1/auth/token",
+                json={"username": "mallory", "role": "platform_admin"},
+            ).status_code
+            == 401
+        )
+        valid_token = create_jwt_token(
+            "alice_ops",
+            ["platform_admin"],
+            expires_in_seconds=300,
+            groups=["platform_operators"],
+        )
+        assert (
+            client.post(
+                "/api/v1/auth/token",
+                headers={"Authorization": f"Bearer {valid_token}"},
+                json={"username": "mallory", "role": "platform_admin"},
+            ).status_code
+            == 403
+        )
+
+
+def test_rs256_jwks_and_issuer_audience_validation(monkeypatch):
+    bundle = generate_rsa_keypair_and_jwks(kid="idp-test-1")
+    issuer = "https://idp.enterprise.example"
+    audience = "enterprise-mcp-router"
+
+    good_jwt = create_rs256_jwt_token(
+        username="oidc_approver",
+        roles=["super_admin"],
+        private_pem=bundle["private_pem"],
+        expires_in_seconds=300,
+        groups=["hitl_approvers"],
+        kid="idp-test-1",
+        issuer=issuer,
+        audience=audience,
+    )
+    claims = verify_jwt_token(
+        good_jwt,
+        jwks=bundle["jwks"],
+        expected_issuer=issuer,
+        expected_audience=audience,
+    )
+    assert claims["sub"] == "oidc_approver"
+    assert "hitl_approvers" in claims["groups"]
+
+    with pytest.raises(ValueError):
+        verify_jwt_token(
+            good_jwt,
+            jwks=bundle["jwks"],
+            expected_issuer="https://wrong-idp.example",
+            expected_audience=audience,
+        )
+
+    with pytest.raises(ValueError):
+        verify_jwt_token(
+            good_jwt,
+            jwks=bundle["jwks"],
+            expected_issuer=issuer,
+            expected_audience="wrong-audience",
+        )
+
+    monkeypatch.delenv("ROUTER_DEV_MODE", raising=False)
+    monkeypatch.delenv("ROUTER_JWT_SECRET", raising=False)
+    monkeypatch.delenv("ROUTER_JWT_PUBLIC_KEY_PEM", raising=False)
+    monkeypatch.setenv("ROUTER_JWKS_JSON", json.dumps(bundle["jwks"]))
+    monkeypatch.setenv("ROUTER_JWT_ISSUER", issuer)
+    monkeypatch.setenv("ROUTER_JWT_AUDIENCE", audience)
+
+    with TestClient(app) as client:
+        resp = client.get(
+            "/api/v1/governance/audit-verify",
+            headers={"Authorization": f"Bearer {good_jwt}"},
+        )
+        assert resp.status_code == 200
+        assert resp.json()["valid"] is True
+
+
+def test_sock_puppet_dual_account_self_approval_defeated():
+    mallory_jwt = create_jwt_token(
+        "mallory",
+        ["super_admin"],
+        expires_in_seconds=600,
+        groups=["platform_operators"],
+    )
+    sock_puppet_jwt = create_jwt_token(
+        "sock_puppet",
+        ["super_admin"],
+        expires_in_seconds=600,
+        groups=["platform_operators"],
+    )
+    real_approver_jwt = create_jwt_token(
+        "sec_director",
+        ["super_admin"],
+        expires_in_seconds=600,
+        groups=["hitl_approvers"],
+    )
+
+    with TestClient(app) as client:
+        mint_super = client.post(
+            "/api/v1/auth/token",
+            json={"username": "attacker", "role": "super_admin"},
+        )
+        assert mint_super.status_code == 422
+
+        create_resp = client.post(
+            "/api/v1/governance/hitl/create",
+            headers={"Authorization": f"Bearer {mallory_jwt}"},
+            json={
+                "tool_name": "postgres.execute_outbound_wire",
+                "arguments": {
+                    "from_account": "ACC-9001",
+                    "to_account": "ACC-9003",
+                    "amount_usd": 5000.0,
+                },
+                "justification": "sock puppet separation-of-duties verification",
+            },
+        )
+        assert create_resp.status_code == 200
+        create_data = create_resp.json()
+        assert create_data["status"] == "PENDING_APPROVAL"
+        ticket_id = create_data["ticket_id"]
+
+        puppet_resolve = client.post(
+            "/api/v1/governance/hitl/resolve",
+            headers={"Authorization": f"Bearer {sock_puppet_jwt}"},
+            json={
+                "ticket_id": ticket_id,
+                "decision": "APPROVED",
+                "notes": "sock puppet self-approval attempt",
+            },
+        )
+        assert puppet_resolve.status_code == 403
+        assert "hitl_approvers" in puppet_resolve.text or "reviewer_missing_approver_group" in puppet_resolve.text
+
+        real_resolve = client.post(
+            "/api/v1/governance/hitl/resolve",
+            headers={"Authorization": f"Bearer {real_approver_jwt}"},
+            json={
+                "ticket_id": ticket_id,
+                "decision": "APPROVED",
+                "notes": "independent peer approval",
+            },
+        )
+        assert real_resolve.status_code == 200
+        assert real_resolve.json()["status"] == "APPROVED"
+
+
+def test_sql_guard_table_allowlist_union_subquery_cte_shadowing():
+    sf = SnowflakeCortexConnector(
+        allowed_roles=["platform_admin"],
+        allowed_schemas=["PORTFOLIO_GOLD", "CORTEX_DOCS"],
+    )
+    pg = PostgresEnterpriseConnector()
+    vsm = ValueStreamManagementConnector()
+
+    blocked_snowflake = [
+        ("other_schema", "SELECT * FROM other_schema.payroll", "PORTFOLIO_GOLD"),
+        (
+            "union_secrets",
+            "SELECT * FROM PORTFOLIO_GOLD.FUNDS UNION ALL SELECT * FROM secrets.pii",
+            "PORTFOLIO_GOLD",
+        ),
+        (
+            "subquery_restricted",
+            "SELECT * FROM PORTFOLIO_GOLD.FUNDS WHERE id IN (SELECT user_id FROM restricted.secret)",
+            "PORTFOLIO_GOLD",
+        ),
+        (
+            "schema_param_mismatch",
+            "SELECT * FROM CORTEX_DOCS.COMPLIANCE_CHUNKS",
+            "PORTFOLIO_GOLD",
+        ),
+        ("unqualified_table", "SELECT * FROM FUNDS", "PORTFOLIO_GOLD"),
+        ("quoted_forbidden", 'SELECT * FROM "secrets"."pii"', "PORTFOLIO_GOLD"),
+        (
+            "cte_shadowing",
+            "WITH FUNDS AS (SELECT * FROM secrets.pii) SELECT * FROM FUNDS",
+            "PORTFOLIO_GOLD",
+        ),
+    ]
+    for label, sql, schema in blocked_snowflake:
+        res = sf.validate_readonly_sql(sql=sql, role="platform_admin", schema=schema)
+        assert res["valid"] is False, f"Snowflake query should block ({label}): {res}"
+
+    safe_sf = sf.validate_readonly_sql(
+        sql='SELECT * FROM "PORTFOLIO_GOLD"."FUNDS" LIMIT 5',
+        role="platform_admin",
+        schema="PORTFOLIO_GOLD",
+    )
+    assert safe_sf["valid"] is True, f"Valid quoted Snowflake table blocked: {safe_sf}"
+
+    for bad_pg in [
+        "SELECT * FROM other_schema.payroll",
+        "SELECT * FROM accounts UNION ALL SELECT * FROM secrets.pii",
+        "SELECT * FROM sqlite_master",
+        "WITH accounts AS (SELECT 1) SELECT * FROM accounts",
+    ]:
+        pg_res = pg.query_ledger(bad_pg)
+        assert pg_res["status"] == "error", f"Postgres query should block ({bad_pg}): {pg_res}"
+
+    ok_pg = pg.query_ledger("SELECT account_id, portfolio_name FROM accounts LIMIT 2")
+    assert ok_pg["status"] == "ok", f"Safe Postgres query failed: {ok_pg}"
+
+    for bad_vsm in [
+        "SELECT * FROM secrets.pii",
+        "SELECT * FROM engineering_tickets UNION ALL SELECT * FROM restricted.secret",
+        "SELECT * FROM sqlite_master",
+        "WITH engineering_tickets AS (SELECT 1) SELECT * FROM engineering_tickets",
+    ]:
+        vsm_res = vsm.query_vsm_sql(bad_vsm)
+        assert vsm_res["status"] == "error", f"VSM query should block ({bad_vsm}): {vsm_res}"
+
+    ok_vsm = vsm.query_vsm_sql("SELECT ticket_id, team FROM engineering_tickets LIMIT 2")
+    assert ok_vsm["status"] == "ok", f"Safe VSM query failed: {ok_vsm}"
+
+
+def test_default_sqlite_wal_storage_and_restart_hydration(tmp_path, monkeypatch):
+    monkeypatch.delenv("ROUTER_STORAGE_BACKEND", raising=False)
+    monkeypatch.delenv("ROUTER_SQLITE_PATH", raising=False)
+    monkeypatch.chdir(tmp_path)
+
+    original_storage = mcp_router.storage
+    created_store = None
+    try:
+        reset_default_storage(None)
+        created_store = get_default_storage()
+        assert isinstance(created_store, SQLiteStateStore)
+        expected_db = tmp_path / "enterprise_router.db"
+        assert expected_db.exists()
+        assert created_store.verify_audit_chain()["backend"] == "sqlite_wal"
+
+        router_a = EnterpriseMCPRouter.from_enterprise_catalog(storage=created_store)
+        ticket = router_a.create_hitl_interrupt(
+            tool_name="postgres.execute_outbound_wire",
+            requested_by="restart_agent",
+            user_roles=["platform_admin"],
+            requester_groups=["platform_operators"],
+        )
+        router_a.resolve_hitl_interrupt(
+            ticket["ticket_id"],
+            reviewer="restart_approver",
+            decision="APPROVED",
+            reviewer_roles=["platform_admin"],
+            reviewer_groups=["hitl_approvers"],
+        )
+        created_store.close()
+        created_store = None
+
+        reloaded_store = SQLiteStateStore(str(expected_db))
+        try:
+            router_b = EnterpriseMCPRouter.from_enterprise_catalog(storage=reloaded_store)
+            assert ticket["ticket_id"] in router_b.hitl_tickets
+            assert router_b.hitl_tickets[ticket["ticket_id"]]["status"] == "APPROVED"
+            assert len(router_b.audit_trail) >= 2
+            assert reloaded_store.verify_audit_chain()["valid"] is True
+        finally:
+            reloaded_store.close()
+    finally:
+        if created_store is not None:
+            created_store.close()
+        reset_default_storage(original_storage)

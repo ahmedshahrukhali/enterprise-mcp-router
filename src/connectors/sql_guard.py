@@ -76,6 +76,8 @@ class SafeSQLValidator:
         dialect: str = "snowflake",
         allowed_roles: Optional[Set[str]] = None,
         allowed_schemas: Optional[Set[str]] = None,
+        allowed_tables: Optional[Set[str]] = None,
+        require_qualified_tables: bool = False,
         role: Optional[str] = None,
         schema: Optional[str] = None,
     ) -> Dict[str, Any]:
@@ -185,17 +187,121 @@ class SafeSQLValidator:
 
         stmt = statements[0]
 
-        # 6. Verify table schemas referenced in the AST against allowed_schemas (if specified)
-        if allowed_schemas is not None:
-            for table_node in stmt.find_all(exp.Table):
-                tbl_db = table_node.db
-                if tbl_db and tbl_db.upper() not in {s.upper() for s in allowed_schemas}:
+        # 6. Verify CTE aliases (block shadowing) and every exp.Table in the AST
+        #    (covering FROM, JOIN, UNION/UNION ALL, subqueries, and CTE bodies).
+        upper_allowed_schemas = {s.upper() for s in allowed_schemas} if allowed_schemas is not None else None
+        upper_allowed_tables = {t.upper() for t in allowed_tables} if allowed_tables is not None else None
+        allowlisted_short_names = {t.split(".")[-1] for t in (upper_allowed_tables or set())}
+
+        valid_cte_aliases: Set[str] = set()
+        for cte in stmt.find_all(exp.CTE):
+            alias = (cte.alias_or_name or "").strip().upper()
+            if not alias:
+                continue
+            if alias in allowlisted_short_names:
+                return {
+                    "valid": False,
+                    "reason": "cte_table_shadowing_blocked",
+                    "role": role,
+                    "schema": schema,
+                    "blocked_cte": cte.alias_or_name,
+                }
+            valid_cte_aliases.add(alias)
+
+        for table_node in stmt.find_all(exp.Table):
+            tbl_catalog = (table_node.catalog or "").strip()
+            tbl_db = (table_node.db or "").strip()
+            tbl_name = (table_node.name or "").strip()
+            fq_name = ".".join(part for part in (tbl_catalog, tbl_db, tbl_name) if part)
+
+            # A local CTE alias reference (unqualified, matching a non-shadowing CTE) is permitted
+            # because every exp.Table inside the CTE definition itself is validated in this loop.
+            if not tbl_catalog and not tbl_db and tbl_name.upper() in valid_cte_aliases:
+                continue
+
+            if tbl_catalog and (upper_allowed_tables is not None or upper_allowed_schemas is not None):
+                return {
+                    "valid": False,
+                    "reason": "unauthorized_table_access",
+                    "role": role,
+                    "schema": schema,
+                    "unauthorized_table": fq_name,
+                }
+
+            if upper_allowed_schemas is not None:
+                if tbl_db:
+                    if tbl_db.upper() not in upper_allowed_schemas:
+                        return {
+                            "valid": False,
+                            "reason": (
+                                "snowflake_schema_not_allowlisted"
+                                if dialect == "snowflake"
+                                else "schema_not_allowlisted"
+                            ),
+                            "role": role,
+                            "schema": schema,
+                            "unauthorized_schema": tbl_db,
+                            "unauthorized_table": fq_name,
+                        }
+                    if schema is not None and tbl_db.upper() != schema.upper():
+                        return {
+                            "valid": False,
+                            "reason": (
+                                "snowflake_schema_not_allowlisted"
+                                if dialect == "snowflake"
+                                else "schema_not_allowlisted"
+                            ),
+                            "role": role,
+                            "schema": schema,
+                            "unauthorized_schema": tbl_db,
+                            "unauthorized_table": fq_name,
+                        }
+                elif require_qualified_tables:
                     return {
                         "valid": False,
-                        "reason": "snowflake_schema_not_allowlisted" if dialect == "snowflake" else "schema_not_allowlisted",
+                        "reason": "unqualified_table_not_allowed",
                         "role": role,
                         "schema": schema,
-                        "unauthorized_schema": tbl_db,
+                        "unauthorized_table": fq_name,
+                    }
+            elif schema is not None and tbl_db and tbl_db.upper() != schema.upper():
+                return {
+                    "valid": False,
+                    "reason": "schema_not_allowlisted",
+                    "role": role,
+                    "schema": schema,
+                    "unauthorized_schema": tbl_db,
+                    "unauthorized_table": fq_name,
+                }
+
+            if upper_allowed_tables is not None:
+                if not tbl_name:
+                    return {
+                        "valid": False,
+                        "reason": "unauthorized_table_access",
+                        "role": role,
+                        "schema": schema,
+                        "unauthorized_table": fq_name,
+                    }
+                if tbl_db:
+                    allowed = f"{tbl_db}.{tbl_name}".upper() in upper_allowed_tables
+                else:
+                    if require_qualified_tables:
+                        return {
+                            "valid": False,
+                            "reason": "unqualified_table_not_allowed",
+                            "role": role,
+                            "schema": schema,
+                            "unauthorized_table": fq_name,
+                        }
+                    allowed = tbl_name.upper() in upper_allowed_tables
+                if not allowed:
+                    return {
+                        "valid": False,
+                        "reason": "unauthorized_table_access",
+                        "role": role,
+                        "schema": schema,
+                        "unauthorized_table": fq_name,
                     }
 
         normalized = stmt.sql(dialect=dialect)

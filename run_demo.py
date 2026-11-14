@@ -9,6 +9,11 @@ Demonstrates:
 6. Value Stream Management (VSM) — OKRs, Product Portfolios & Engineering Work Ticket Concern Advisor
 """
 
+import os
+
+os.environ.setdefault("ROUTER_DEV_MODE", "1")
+os.environ.setdefault("ROUTER_STORAGE_BACKEND", "memory")
+
 from src.router import (
     AgentFrameworkBridges,
     BedrockAgentCoreAdapter,
@@ -71,12 +76,14 @@ def main() -> None:
         requested_by="langgraph_treasury_agent",
         user_roles=["platform_admin"],
         arguments=wire_args,
+        requester_groups=["platform_operators"],
     )
     resolved = router.resolve_hitl_interrupt(
         ticket_id=ticket["ticket_id"],
         reviewer="sr_ops_approver@enterprise.io",
         decision="APPROVED",
         reviewer_roles=["super_admin"],
+        reviewer_groups=["hitl_approvers"],
     )
     auth_after = router.authorize_execution(
         "postgres.execute_outbound_wire",

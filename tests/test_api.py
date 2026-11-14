@@ -329,5 +329,36 @@ def test_routing_feedback_misses_and_audit_chain_endpoints():
     audit = client.get("/api/v1/governance/audit-verify")
     assert audit.status_code == 200
     assert audit.json()["valid"] is True
+    assert audit.json()["backend"] == "sqlite_wal"
     assert audit.json()["checked_events"] >= 1
+
+
+def test_builtin_domain_sandbox_and_live_sqlite_execution_modes():
+    devops_call = client.post(
+        "/mcp/jsonrpc",
+        headers={"X-API-Key": "ak-admin-demo"},
+        json={
+            "jsonrpc": "2.0",
+            "id": 92,
+            "method": "tools/call",
+            "params": {"name": "devops.list_snyk_cve_alerts", "arguments": {"query_or_id": "payments-api", "limit": 3}},
+        },
+    ).json()
+    devops_out = devops_call["result"]["content"][0]["json"]
+    assert devops_out["execution_mode"] == "sandbox_simulation"
+    assert devops_out["domain"] == "devops"
+    assert "sandbox_telemetry" in devops_out
+
+    vsm_call = client.post(
+        "/mcp/jsonrpc",
+        headers={"X-API-Key": "ak-analyst-demo"},
+        json={
+            "jsonrpc": "2.0",
+            "id": 93,
+            "method": "tools/call",
+            "params": {"name": "portfolio_vsm.detect_management_concerns", "arguments": {"portfolio_id": "PF-101"}},
+        },
+    ).json()
+    vsm_out = vsm_call["result"]["content"][0]["json"]
+    assert vsm_out["execution_mode"] == "live_sqlite"
 

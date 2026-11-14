@@ -55,15 +55,28 @@ def _execute_readonly_sqlite(
 
 class SnowflakeCortexConnector:
     """
-    Governed Snowflake retrieval connector for enterprise Agentic AI workflows.
-    Delegates SQL inspection exclusively to SafeSQLValidator (sqlglot AST allow-list),
-    enforces read-only RBAC roles and schema allow-lists, and executes hybrid Cortex Search.
-    In production, pair with a dedicated read-only Snowflake role and warehouse session.
+    Governed Snowflake retrieval connector for Agentic AI workflows.
+    Delegates SQL inspection to SafeSQLValidator (sqlglot AST schema + table allow-list),
+    enforces read-only RBAC roles, and executes hybrid Cortex Search.
+    In live Snowflake deployments, pair with a dedicated read-only Snowflake role and warehouse session.
     """
 
-    def __init__(self, allowed_roles: List[str], allowed_schemas: List[str]):
+    DEFAULT_ALLOWED_TABLES: Set[str] = {
+        "PORTFOLIO_GOLD.FUNDS",
+        "PORTFOLIO_GOLD.HOLDINGS",
+        "PORTFOLIO_GOLD.BENCHMARKS",
+        "CORTEX_DOCS.COMPLIANCE_CHUNKS",
+    }
+
+    def __init__(
+        self,
+        allowed_roles: List[str],
+        allowed_schemas: List[str],
+        allowed_tables: Optional[List[str]] = None,
+    ):
         self.allowed_roles = set(allowed_roles)
         self.allowed_schemas = set(allowed_schemas)
+        self.allowed_tables = set(allowed_tables) if allowed_tables is not None else set(self.DEFAULT_ALLOWED_TABLES)
         self._knowledge_chunks: List[Dict[str, Any]] = []
         self._structured_funds: List[Dict[str, Any]] = [
             {"fund_id": "FID-CDN-EQ-01", "name": "Canadian Disciplined Equity Fund", "nav": 48.72, "aum_cad_m": 4120.5, "risk_tier": "MEDIUM", "active": 1},
@@ -110,12 +123,14 @@ class SnowflakeCortexConnector:
         return len(self._knowledge_chunks)
 
     def validate_readonly_sql(self, sql: str, role: str, schema: str) -> Dict[str, Any]:
-        """Validates that an agent-generated Snowflake query obeys read-only RBAC policies using AST inspection."""
+        """Validates that an agent-generated Snowflake query obeys read-only RBAC and table/schema allow-lists."""
         res = SafeSQLValidator.validate_readonly_sql(
             sql=sql,
             dialect="snowflake",
             allowed_roles=self.allowed_roles,
             allowed_schemas=self.allowed_schemas,
+            allowed_tables=self.allowed_tables,
+            require_qualified_tables=True,
             role=role,
             schema=schema,
         )
@@ -323,7 +338,13 @@ class PostgresEnterpriseConnector:
         if role not in self.ALLOWED_ROLES:
             return {"status": "error", "reason": "postgres_rbac_role_denied", "rows": []}
 
-        validation = SafeSQLValidator.validate_readonly_sql(sql=sql, dialect="postgres")
+        validation = SafeSQLValidator.validate_readonly_sql(
+            sql=sql,
+            dialect="postgres",
+            allowed_schemas={"PUBLIC"},
+            allowed_tables={"ACCOUNTS", "AUDIT_LOG", "PUBLIC.ACCOUNTS", "PUBLIC.AUDIT_LOG"},
+            require_qualified_tables=False,
+        )
         if not validation["valid"]:
             return {
                 "status": "error",
@@ -618,7 +639,20 @@ class ValueStreamManagementConnector:
         params: Optional[List[Any]] = None,
     ) -> Dict[str, Any]:
         """Executes an AST-validated, read-only SQL query across connected VSM tables."""
-        validation = SafeSQLValidator.validate_readonly_sql(sql=sql, dialect="sqlite")
+        validation = SafeSQLValidator.validate_readonly_sql(
+            sql=sql,
+            dialect="sqlite",
+            allowed_schemas={"MAIN"},
+            allowed_tables={
+                "PRODUCT_PORTFOLIOS",
+                "OBJECTIVES_OKRS",
+                "ENGINEERING_TICKETS",
+                "MAIN.PRODUCT_PORTFOLIOS",
+                "MAIN.OBJECTIVES_OKRS",
+                "MAIN.ENGINEERING_TICKETS",
+            },
+            require_qualified_tables=False,
+        )
         if not validation["valid"]:
             return {
                 "status": "error",
