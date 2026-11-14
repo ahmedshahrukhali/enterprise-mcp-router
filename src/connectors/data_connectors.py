@@ -19,6 +19,17 @@ from typing import Any, ClassVar
 from src.connectors.sql_guard import SafeSQLValidator
 
 
+def _sqlite_allow_all_authorizer(
+    action: int,
+    arg1: str | None,
+    arg2: str | None,
+    db_name: str | None,
+    trigger: str | None,
+) -> int:
+    """SQLite authorizer callback restoring normal execution after a read-only query (Python 3.10 compatibility)."""
+    return sqlite3.SQLITE_OK
+
+
 def _sqlite_readonly_authorizer(
     action: int,
     arg1: str | None,
@@ -51,7 +62,7 @@ def _execute_readonly_sqlite(
             cursor = conn.execute(sql, tuple(params or ()))
             return [dict(row) for row in cursor.fetchall()]
         finally:
-            conn.set_authorizer(None)
+            conn.set_authorizer(_sqlite_allow_all_authorizer)
 
 
 class SnowflakeCortexConnector:
