@@ -1,6 +1,6 @@
 """
 Semantic Routing Recall and False-Positive Resistance Benchmark.
-Evaluates semantic routing precision and top-k recall across all 7 enterprise domains:
+Evaluates semantic routing precision and top-k recall across all 8 enterprise domains:
   1. snowflake
   2. informatica
   3. postgres
@@ -8,6 +8,7 @@ Evaluates semantic routing precision and top-k recall across all 7 enterprise do
   5. supply_chain
   6. crm_rest
   7. knowledge_graph
+  8. portfolio_vsm
 """
 
 import pytest
@@ -48,6 +49,11 @@ ROUTER_RECALL_TEST_CASES = [
     ("Execute Neo4j Cypher multihop graph traversal for entity relationships", "knowledge_graph"),
     ("Query Qdrant hybrid vector index for policy chunk reranking", "knowledge_graph"),
     ("Traverse knowledge graph ontology for regulatory compliance", "knowledge_graph"),
+
+    # Value Stream Management (VSM & OKRs)
+    ("Detect management concerns across at-risk OKRs and VSM bottlenecks", "portfolio_vsm"),
+    ("Compute Value Stream flow efficiency, velocity, and blocked engineering blockers", "portfolio_vsm"),
+    ("Reallocate squad capacity across product roadmap epics to protect OKR milestones", "portfolio_vsm"),
 ]
 
 

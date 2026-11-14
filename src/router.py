@@ -1,13 +1,17 @@
 """
-Enterprise Model Context Protocol (MCP) Server, Semantic Tool Router & Cloud Data Connectors.
+Enterprise Model Context Protocol (MCP) Server, Hybrid Semantic + BM25 Tool Router & Cloud Data Connectors.
 Provides:
 - FastMCP-compatible decorator registration (@mcp.tool) and JSON-RPC 2.0 protocol dispatch
-- Dense semantic + lexical top-k tool routing across 105+ registered enterprise tools (~92% token savings)
-- OAuth2 / RBAC governance & stateful Human-in-the-Loop (HITL) approval interrupt queue
+- 64-dim Feature-Hashed Dense + Okapi BM25 + RRF top-k tool routing across 120+ registered enterprise tools
+- OAuth2 / RBAC governance, JSON Schema Draft-07 input/output contract validation & stateful HITL approval queue
 - Re-exports of SnowflakeCortexConnector, InformaticaCloudTaskflowAdapter, PostgresEnterpriseConnector,
-  EnterpriseRESTConnector, BedrockAgentCoreAdapter, AgentFrameworkBridges, and ProductionTelemetryMonitor.
+  ValueStreamManagementConnector, EnterpriseRESTConnector, BedrockAgentCoreAdapter, AgentFrameworkBridges,
+  and ProductionTelemetryMonitor.
 """
 
+import inspect
+import json
+import re
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -19,8 +23,13 @@ from src.connectors.data_connectors import (
     InformaticaCloudTaskflowAdapter,
     PostgresEnterpriseConnector,
     SnowflakeCortexConnector,
+    ValueStreamManagementConnector,
 )
-from src.registry.catalog import compute_query_embedding, get_enterprise_tool_catalog
+from src.registry.catalog import (
+    OkapiBM25Index,
+    compute_query_embedding,
+    get_enterprise_tool_catalog,
+)
 from src.security import HITLGovernanceRules
 from src.storage import BaseStateStore, get_default_storage
 from src.telemetry.observability import ProductionTelemetryMonitor, TraceSpan
@@ -44,10 +53,76 @@ class MCPToolSpec:
     schema_tokens: int = 148
 
 
+class JSONSchemaContractValidator:
+    """
+    Deterministic JSON Schema Draft-07 contract validator for MCP tool arguments
+    and structured agent outputs.
+    """
+
+    @staticmethod
+    def _matches_type(value: Any, expected_type: str) -> bool:
+        if expected_type == "string":
+            return isinstance(value, str)
+        if expected_type == "integer":
+            return isinstance(value, int) and not isinstance(value, bool)
+        if expected_type == "number":
+            return isinstance(value, (int, float)) and not isinstance(value, bool)
+        if expected_type == "boolean":
+            return isinstance(value, bool)
+        if expected_type == "array":
+            return isinstance(value, list)
+        if expected_type == "object":
+            return isinstance(value, dict)
+        return True
+
+    @classmethod
+    def validate(cls, schema: Dict[str, Any], payload: Any) -> Dict[str, Any]:
+        """Validates `payload` against a JSON Schema object contract."""
+        errors: List[str] = []
+        expected_root = schema.get("type", "object")
+        if expected_root == "object" and not isinstance(payload, dict):
+            return {"valid": False, "errors": [f"expected object payload, got {type(payload).__name__}"]}
+
+        if not isinstance(payload, dict):
+            return {"valid": True, "errors": []}
+
+        for req_key in schema.get("required", []):
+            if req_key not in payload or payload[req_key] is None:
+                errors.append(f"missing_required_field:{req_key}")
+
+        properties = schema.get("properties", {})
+        for key, value in payload.items():
+            prop_schema = properties.get(key)
+            if not prop_schema:
+                continue
+
+            expected_type = prop_schema.get("type")
+            if expected_type and not cls._matches_type(value, expected_type):
+                errors.append(f"invalid_type:{key}:expected_{expected_type}_got_{type(value).__name__}")
+                continue
+
+            if "enum" in prop_schema and value not in prop_schema["enum"]:
+                errors.append(f"enum_violation:{key}:value_{value}_not_in_{prop_schema['enum']}")
+
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                if "minimum" in prop_schema and value < prop_schema["minimum"]:
+                    errors.append(f"minimum_violation:{key}:{value}<{prop_schema['minimum']}")
+                if "maximum" in prop_schema and value > prop_schema["maximum"]:
+                    errors.append(f"maximum_violation:{key}:{value}>{prop_schema['maximum']}")
+
+            if isinstance(value, str):
+                if "minLength" in prop_schema and len(value) < prop_schema["minLength"]:
+                    errors.append(f"min_length_violation:{key}:len={len(value)}<{prop_schema['minLength']}")
+                if "pattern" in prop_schema and not re.search(prop_schema["pattern"], value):
+                    errors.append(f"pattern_violation:{key}")
+
+        return {"valid": len(errors) == 0, "errors": errors}
+
+
 class EnterpriseMCPRouter:
     """
-    Routes agent intents to top-k MCP tools via dense semantic + lexical scoring
-    and enforces deterministic OAuth2 RBAC + Human-in-the-Loop (HITL) governance.
+    Routes agent intents to top-k MCP tools via hybrid 64-dim dense + Okapi BM25 + RRF scoring
+    and enforces deterministic OAuth2 RBAC, JSON Schema validation & HITL governance.
     """
 
     def __init__(
@@ -61,10 +136,25 @@ class EnterpriseMCPRouter:
         self.storage: BaseStateStore = storage or get_default_storage()
         self.hitl_tickets: Dict[str, Dict[str, Any]] = {}
         self.audit_trail: List[Dict[str, Any]] = []
+        self._bm25_index = self._build_bm25_index()
+
+    def _build_bm25_index(self) -> OkapiBM25Index:
+        docs = [
+            (spec.name, f"{spec.name} {spec.domain} {spec.description}")
+            for spec in self.tools.values()
+        ]
+        return OkapiBM25Index(docs)
+
+    def rebuild_index(self) -> None:
+        """Rebuilds the Okapi BM25 lexical index after dynamic tool registration."""
+        self._bm25_index = self._build_bm25_index()
 
     @classmethod
-    def from_enterprise_catalog(cls, storage: Optional[BaseStateStore] = None) -> "EnterpriseMCPRouter":
-        """Instantiates router pre-loaded with the 105-tool Enterprise MCP Catalog."""
+    def from_enterprise_catalog(
+        cls,
+        storage: Optional[BaseStateStore] = None,
+    ) -> "EnterpriseMCPRouter":
+        """Instantiates router pre-loaded with the 120-tool Enterprise MCP Catalog."""
         return cls(tools=cls._load_default_catalog_specs(), storage=storage)
 
     @staticmethod
@@ -100,40 +190,51 @@ class EnterpriseMCPRouter:
         domain_filter: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
-        Routes a natural language agent intent across the full 105+ tool registry,
-        combining dense embedding cosine similarity with lexical keyword boosting,
-        and calculates context-window token reduction vs. exposing all tools.
+        Routes a natural language agent intent across the full 120+ tool registry,
+        combining 64-dim dense embedding cosine similarity with Okapi BM25 and
+        Reciprocal Rank Fusion (RRF), and calculates context-window token reduction.
         """
         t0 = time.perf_counter()
         q_emb = compute_query_embedding(query)
-        q_tokens = {
-            tok.strip(".,;:!?()[]{}\"'`").lower()
-            for tok in query.replace("_", " ").replace(".", " ").replace("-", " ").split()
-            if len(tok) > 2
-        }
 
-        scored_items: List[tuple[float, MCPToolSpec]] = []
-        for spec in self.tools.values():
-            if domain_filter and spec.domain != domain_filter:
-                continue
-            dense_score = sum(q * t for q, t in zip(q_emb, spec.embedding))
-            haystack = f"{spec.name} {spec.domain} {spec.description}".lower()
-            lexical_hits = sum(1 for tok in q_tokens if tok in haystack)
-            lexical_boost = min(0.35, lexical_hits * 0.07)
-            combined_score = round(min(0.998, dense_score * 0.78 + lexical_boost), 4)
-            scored_items.append((combined_score, spec))
+        candidates: List[MCPToolSpec] = [
+            spec
+            for spec in self.tools.values()
+            if not domain_filter or spec.domain == domain_filter
+        ]
 
-        scored_items.sort(key=lambda x: (x[0], not x[1].is_mutating), reverse=True)
+        dense_scores: Dict[str, float] = {}
+        bm25_scores: Dict[str, float] = {}
+        for spec in candidates:
+            dense_scores[spec.name] = max(0.0, sum(q * t for q, t in zip(q_emb, spec.embedding)))
+            bm25_scores[spec.name] = self._bm25_index.score(query, spec.name)
+
+        dense_order = sorted(candidates, key=lambda s: dense_scores[s.name], reverse=True)
+        bm25_order = sorted(candidates, key=lambda s: bm25_scores[s.name], reverse=True)
+        dense_ranks = {spec.name: idx + 1 for idx, spec in enumerate(dense_order)}
+        bm25_ranks = {spec.name: idx + 1 for idx, spec in enumerate(bm25_order)}
+        max_rrf = 2.0 / 61.0
+
+        scored_items: List[tuple[float, float, float, MCPToolSpec]] = []
+        for spec in candidates:
+            d_score = dense_scores[spec.name]
+            b_score = bm25_scores[spec.name]
+            rrf_raw = (1.0 / (60.0 + dense_ranks[spec.name])) + (1.0 / (60.0 + bm25_ranks[spec.name]))
+            rrf_norm = rrf_raw / max_rrf
+            combined_score = round(min(0.998, 0.55 * d_score + 0.35 * b_score + 0.10 * rrf_norm), 4)
+            scored_items.append((combined_score, round(d_score, 4), round(b_score, 4), spec))
+
+        scored_items.sort(key=lambda x: (x[0], not x[3].is_mutating), reverse=True)
         top_specs = scored_items[:k]
 
         full_tokens = sum(s.schema_tokens for s in self.tools.values())
-        routed_tokens = sum(s.schema_tokens for _, s in top_specs)
+        routed_tokens = sum(s.schema_tokens for _, _, _, s in top_specs)
         reduction_pct = (
             round((1.0 - (routed_tokens / max(full_tokens, 1))) * 100.0, 2)
             if full_tokens > 0
             else 0.0
         )
-        elapsed_ms = round((time.perf_counter() - t0) * 1000.0 + 1.4, 2)
+        elapsed_ms = round(max(0.01, (time.perf_counter() - t0) * 1000.0), 3)
 
         return {
             "query": query,
@@ -151,10 +252,26 @@ class EnterpriseMCPRouter:
                     "is_mutating": spec.is_mutating,
                     "required_role": spec.required_role,
                     "similarity_score": score,
+                    "dense_score": d_score,
+                    "bm25_score": b_score,
                     "schema_tokens": spec.schema_tokens,
+                    "input_schema": spec.input_schema,
                 }
-                for score, spec in top_specs
+                for score, d_score, b_score, spec in top_specs
             ],
+        }
+
+    def validate_tool_arguments(self, tool_name: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
+        """Validates invocation arguments against the registered tool's JSON Schema contract."""
+        spec = self.tools.get(tool_name)
+        if not spec:
+            return {"valid": False, "tool_name": tool_name, "errors": ["tool_not_found"]}
+        check = JSONSchemaContractValidator.validate(spec.input_schema, arguments)
+        return {
+            "valid": check["valid"],
+            "tool_name": tool_name,
+            "errors": check["errors"],
+            "schema": spec.input_schema,
         }
 
     def create_hitl_interrupt(
@@ -352,25 +469,70 @@ class EnterpriseMCPRouter:
 
 class FastMCPServer:
     """
-    Standardized FastMCP & JSON-RPC 2.0 Protocol Server wrapping EnterpriseMCPRouter,
-    SnowflakeCortexConnector, InformaticaCloudTaskflowAdapter, and PostgresEnterpriseConnector.
+    Standardized FastMCP & JSON-RPC 2.0 Protocol Server wrapping EnterpriseMCPRouter
+    and governed enterprise connectors.
     Supports `@mcp.tool()` registration and MCP methods:
-      - `initialize`
-      - `tools/list` (with optional semantic `query` filtering)
-      - `tools/call` (with RBAC & HITL enforcement)
-      - `resources/list`
+      - `initialize`, `ping`
+      - `tools/list` (with semantic `query` filtering)
+      - `tools/call` (with JSON Schema contract validation, RBAC & HITL enforcement)
+      - `resources/list`, `resources/read`
+      - `prompts/list`, `prompts/get`
     """
+
+    _PY_TYPE_TO_JSON = {
+        str: "string",
+        int: "integer",
+        float: "number",
+        bool: "boolean",
+        dict: "object",
+        list: "array",
+    }
+
+    _PROMPTS_CATALOG: Dict[str, Dict[str, Any]] = {
+        "vsm_management_concern_briefing": {
+            "name": "vsm_management_concern_briefing",
+            "description": "Analyze connected OKRs, product portfolios, and blocked engineering tickets to surface management concerns and corrective actions.",
+            "arguments": [{"name": "portfolio_id", "description": "Optional target portfolio ID", "required": False}],
+            "template": "Review product portfolio {portfolio_id} OKR drift, blocked Jira/GitHub tickets, and flow efficiency bottlenecks. Recommend HITL-governed actions.",
+        },
+        "snowflake_compliance_audit": {
+            "name": "snowflake_compliance_audit",
+            "description": "Audit Snowflake Cortex Search compliance rules and verify read-only SQL RBAC grants.",
+            "arguments": [{"name": "schema_name", "description": "Target Snowflake schema", "required": True}],
+            "template": "Inspect Snowflake schema {schema_name} via read-only SELECT queries and validate RRSP/AML compliance guidelines.",
+        },
+        "devops_cve_remediation_plan": {
+            "name": "devops_cve_remediation_plan",
+            "description": "Triage Snyk/Dependabot CVE findings and stage Docker-verified pull requests.",
+            "arguments": [{"name": "repo_name", "description": "Microservice repository slug", "required": True}],
+            "template": "Aggregate critical CVEs for {repo_name}, verify pytest suite in isolated Docker sandbox, and open a tracked Jira ticket.",
+        },
+    }
 
     def __init__(
         self,
         name: str = "enterprise-mcp-router",
-        version: str = "2.1.0",
+        version: str = "2.2.0",
         router: Optional[EnterpriseMCPRouter] = None,
+        connectors: Optional[Dict[str, Any]] = None,
     ):
         self.name = name
         self.version = version
         self.router = router or EnterpriseMCPRouter.from_enterprise_catalog()
         self.custom_handlers: Dict[str, Callable[..., Any]] = {}
+        self.connectors = connectors or {}
+
+    @classmethod
+    def _infer_schema_from_fn(cls, fn: Callable[..., Any]) -> Dict[str, Any]:
+        sig = inspect.signature(fn)
+        properties: Dict[str, Dict[str, Any]] = {}
+        required: List[str] = []
+        for param_name, param in sig.parameters.items():
+            json_type = cls._PY_TYPE_TO_JSON.get(param.annotation, "string")
+            properties[param_name] = {"type": json_type}
+            if param.default is inspect.Parameter.empty:
+                required.append(param_name)
+        return {"type": "object", "properties": properties, "required": required}
 
     def tool(
         self,
@@ -391,18 +553,65 @@ class FastMCPServer:
                 required_role=required_role,
                 embedding=compute_query_embedding(f"{tool_name} {domain} {tool_desc}"),
                 domain=domain,
+                input_schema=self._infer_schema_from_fn(fn),
             )
             self.router.tools[tool_name] = spec
+            self.router.rebuild_index()
             self.custom_handlers[tool_name] = fn
             return fn
 
         return decorator
+
+    def _dispatch_builtin_connector(self, tool_name: str, arguments: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        vsm = self.connectors.get("vsm")
+        sf = self.connectors.get("snowflake")
+        pg = self.connectors.get("postgres")
+        iics = self.connectors.get("informatica")
+
+        if tool_name == "portfolio_vsm.detect_management_concerns" and vsm is not None:
+            return vsm.analyze_management_concerns(
+                query=arguments.get("query", "Identify management concerns and recommend actions"),
+                portfolio_id=arguments.get("portfolio_id"),
+                router=self.router,
+            )
+        if tool_name == "portfolio_vsm.get_portfolio_health_summary" and vsm is not None:
+            return vsm.get_overview(portfolio_id=arguments.get("portfolio_id"))
+        if tool_name == "snowflake.execute_readonly_sql" and sf is not None:
+            return sf.validate_readonly_sql(
+                sql=arguments.get("sql", "SELECT 1"),
+                role=arguments.get("role", "ai_platform_reader"),
+                schema=arguments.get("schema_name", "PORTFOLIO_GOLD"),
+            )
+        if tool_name == "snowflake.cortex_search_docs" and sf is not None:
+            return sf.retrieve_cortex_rag(
+                query=arguments.get("query_or_id", "RRSP compliance"),
+                role=arguments.get("role", "ai_platform_reader"),
+                top_k=int(arguments.get("limit", 3)),
+            )
+        if tool_name == "postgres.read_accounting_ledger" and pg is not None:
+            return pg.query_ledger(
+                sql="SELECT account_id, portfolio_name, balance_usd, risk_tier FROM accounts ORDER BY balance_usd DESC",
+                role="analyst",
+            )
+        if tool_name == "informatica.validate_taskflow_sla" and iics is not None:
+            return iics.validate_taskflow_run(
+                {
+                    "taskflow_name": arguments.get("query_or_id", "tf_snowflake_fund_docs_elt"),
+                    "status": "SUCCESS",
+                    "rows_processed": 1450,
+                    "freshness_lag_minutes": 8,
+                }
+            )
+        return None
 
     def handle_jsonrpc(self, request_payload: Dict[str, Any]) -> Dict[str, Any]:
         """Processes a standard JSON-RPC 2.0 Model Context Protocol request."""
         req_id = request_payload.get("id", 1)
         method = request_payload.get("method", "")
         params = request_payload.get("params") or {}
+
+        if method == "ping":
+            return {"jsonrpc": "2.0", "id": req_id, "result": {"status": "pong"}}
 
         if method == "initialize":
             return {
@@ -412,9 +621,10 @@ class FastMCPServer:
                     "protocolVersion": "2025-03-26",
                     "serverInfo": {"name": self.name, "version": self.version},
                     "capabilities": {
-                        "tools": {"listChanged": True, "semanticRouting": True},
-                        "resources": {"subscribe": True},
-                        "governance": {"rbac": True, "hitlInterrupts": True},
+                        "tools": {"listChanged": True, "semanticRouting": True, "bm25Hybrid": True},
+                        "resources": {"subscribe": True, "read": True},
+                        "prompts": {"listChanged": False},
+                        "governance": {"rbac": True, "hitlInterrupts": True, "jsonSchemaValidation": True},
                     },
                 },
             }
@@ -465,6 +675,20 @@ class FastMCPServer:
             hitl_approved = bool(params.get("hitl_approved", False))
             hitl_ticket_id = params.get("hitl_ticket_id")
 
+            # 1. Deterministic JSON Schema input contract validation
+            schema_check = self.router.validate_tool_arguments(tool_name, arguments)
+            if not schema_check["valid"] and "tool_not_found" not in schema_check["errors"]:
+                return {
+                    "jsonrpc": "2.0",
+                    "id": req_id,
+                    "error": {
+                        "code": -32602,
+                        "message": "Invalid params: JSON Schema contract violation",
+                        "data": schema_check,
+                    },
+                }
+
+            # 2. Deterministic OAuth2 RBAC & HITL gate
             auth = self.router.authorize_execution(
                 tool_name=tool_name,
                 user_roles=user_roles,
@@ -485,12 +709,17 @@ class FastMCPServer:
             if tool_name in self.custom_handlers:
                 out = self.custom_handlers[tool_name](**arguments)
             else:
-                out = {
-                    "tool": tool_name,
-                    "status": "executed",
-                    "governance": auth,
-                    "arguments_received": arguments,
-                }
+                builtin_out = self._dispatch_builtin_connector(tool_name, arguments)
+                if builtin_out is not None:
+                    out = builtin_out
+                else:
+                    out = {
+                        "tool": tool_name,
+                        "status": "executed",
+                        "schema_validated": True,
+                        "governance": auth,
+                        "arguments_received": arguments,
+                    }
             return {
                 "jsonrpc": "2.0",
                 "id": req_id,
@@ -521,7 +750,86 @@ class FastMCPServer:
                             "name": "Informatica Cloud (IICS) ELT Taskflow Telemetry",
                             "mimeType": "application/json",
                         },
+                        {
+                            "uri": "vsm://planview_portfolios/okrs_and_tickets",
+                            "name": "Value Stream Management (OKRs, Portfolios & Engineering Tickets)",
+                            "mimeType": "application/json",
+                        },
                     ]
+                },
+            }
+
+        if method == "resources/read":
+            uri = params.get("uri", "")
+            resource_map: Dict[str, Any] = {
+                "snowflake://PORTFOLIO_GOLD/CORTEX_DOCS": {
+                    "allowed_roles": ["ai_platform_reader", "analyst", "data_engineer"],
+                    "schemas": ["PORTFOLIO_GOLD", "CORTEX_DOCS"],
+                },
+                "postgres://enterprise_ledger/accounts": (
+                    self.connectors["postgres"]._accounts if "postgres" in self.connectors else {"table": "accounts", "engine": "sqlite3_relational"}
+                ),
+                "informatica://iics/tf_snowflake_fund_docs_elt": {
+                    "taskflow": "tf_snowflake_fund_docs_elt",
+                    "max_lag_minutes": 30,
+                    "min_rows_threshold": 10,
+                },
+                "vsm://planview_portfolios/okrs_and_tickets": (
+                    self.connectors["vsm"].get_overview() if "vsm" in self.connectors else {"portfolios": 4, "okrs": 5, "tickets": 6}
+                ),
+            }
+            if uri not in resource_map:
+                return {
+                    "jsonrpc": "2.0",
+                    "id": req_id,
+                    "error": {"code": -32602, "message": f"Unknown resource URI: {uri}"},
+                }
+            return {
+                "jsonrpc": "2.0",
+                "id": req_id,
+                "result": {
+                    "contents": [
+                        {
+                            "uri": uri,
+                            "mimeType": "application/json",
+                            "text": json.dumps(resource_map[uri]),
+                        }
+                    ]
+                },
+            }
+
+        if method == "prompts/list":
+            prompts = [
+                {
+                    "name": p["name"],
+                    "description": p["description"],
+                    "arguments": p["arguments"],
+                }
+                for p in self._PROMPTS_CATALOG.values()
+            ]
+            return {"jsonrpc": "2.0", "id": req_id, "result": {"prompts": prompts}}
+
+        if method == "prompts/get":
+            prompt_name = params.get("name", "")
+            prompt_args = params.get("arguments") or {}
+            spec = self._PROMPTS_CATALOG.get(prompt_name)
+            if not spec:
+                return {
+                    "jsonrpc": "2.0",
+                    "id": req_id,
+                    "error": {"code": -32602, "message": f"Prompt not found: {prompt_name}"},
+                }
+            rendered = spec["template"].format(
+                portfolio_id=prompt_args.get("portfolio_id", "ALL"),
+                schema_name=prompt_args.get("schema_name", "PORTFOLIO_GOLD"),
+                repo_name=prompt_args.get("repo_name", "enterprise-mcp-router"),
+            )
+            return {
+                "jsonrpc": "2.0",
+                "id": req_id,
+                "result": {
+                    "description": spec["description"],
+                    "messages": [{"role": "user", "content": {"type": "text", "text": rendered}}],
                 },
             }
 
@@ -539,9 +847,11 @@ __all__ = [
     "EnterpriseRESTConnector",
     "FastMCPServer",
     "InformaticaCloudTaskflowAdapter",
+    "JSONSchemaContractValidator",
     "MCPToolSpec",
     "PostgresEnterpriseConnector",
     "ProductionTelemetryMonitor",
     "SnowflakeCortexConnector",
     "TraceSpan",
+    "ValueStreamManagementConnector",
 ]

@@ -1,18 +1,21 @@
 """
-FastAPI REST & JSON-RPC 2.0 Server for Enterprise-MCP-Router.
+FastAPI REST & JSON-RPC 2.0 / SSE Server for Enterprise-MCP-Router.
 Exposes:
 - Interactive Web Control Plane Dashboard (`GET /`)
-- Standardized Model Context Protocol JSON-RPC 2.0 endpoint (`POST /mcp/jsonrpc`)
-- Semantic Tool Routing & Context Bloat Profiler (`POST /api/v1/router/search`)
-- OAuth2 RBAC & Stateful HITL Approval Interrupt Queue (`/api/v1/governance/*`)
-- Governed Snowflake Cortex Search, Informatica Cloud (IICS) & PostgreSQL Connectors (`/api/v1/connectors/*`)
+- Standardized Model Context Protocol JSON-RPC 2.0 & SSE endpoints (`POST /mcp/jsonrpc`, `GET /mcp/sse`, `POST /mcp/messages`)
+- Hybrid Okapi BM25 + 64-Dim Dense Semantic Tool Router (`POST /api/v1/router/search`)
+- OAuth2 RBAC, JSON Schema Contract Validator & Stateful HITL Queue (`/api/v1/governance/*`)
+- Value Stream Management (OKRs, Product Portfolios, Engineering Tickets & Concern Advisor) (`/api/v1/vsm/*`)
+- Governed Snowflake Cortex Search, Informatica Cloud (IICS) & Relational SQLite/PostgreSQL Connectors (`/api/v1/connectors/*`)
 - Amazon Bedrock / AgentCore Converse API & Multi-Framework Bridges (`/api/v1/adapters/*`)
 - OpenTelemetry Tracing, Token Budgets & L2 Operational Runbooks (`/api/v1/telemetry/*`)
 """
 
-from typing import Any, Dict
+import json
+import time
+from typing import Any, Dict, Iterator, Optional
 from fastapi import Depends, FastAPI, HTTPException
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 
 from src.dashboard_html import DASHBOARD_HTML
 from src.security import AuthenticatedPrincipal, get_current_principal
@@ -26,10 +29,13 @@ from src.models import (
     PostgresQueryRequest,
     PostgresSnapshotRequest,
     RunbookLookupRequest,
+    SchemaValidationRequest,
     SemanticRouteRequest,
     SnowflakeCortexQueryRequest,
     SnowflakeSQLValidationRequest,
     TelemetrySpanRequest,
+    VSMConcernRequest,
+    VSMSqlQueryRequest,
 )
 from src.router import (
     AgentFrameworkBridges,
@@ -40,22 +46,21 @@ from src.router import (
     PostgresEnterpriseConnector,
     ProductionTelemetryMonitor,
     SnowflakeCortexConnector,
+    ValueStreamManagementConnector,
 )
 
 app = FastAPI(
     title="Enterprise-MCP-Router",
     description=(
-        "Enterprise Model Context Protocol (FastMCP / JSON-RPC 2.0) Server, 105-Tool Semantic Router, "
-        "RBAC/HITL Governance Gate, Cloud Data Connectors (Snowflake Cortex, Informatica IICS, PostgreSQL), "
-        "and Amazon Bedrock / AgentCore Observability."
+        "Enterprise Model Context Protocol (FastMCP / JSON-RPC 2.0 + SSE) Server, 120-Tool Hybrid BM25+Dense Router, "
+        "RBAC/JSON Schema/HITL Governance Gate, Value Stream Management (OKRs, Portfolios, Engineering Tickets), "
+        "Cloud Data Connectors (Snowflake Cortex, Informatica IICS, SQLite/PostgreSQL), and Amazon Bedrock Observability."
     ),
-    version="2.1.0",
+    version="2.2.0",
 )
 
 # Singleton service instances initialized with realistic enterprise state
 mcp_router = EnterpriseMCPRouter.from_enterprise_catalog()
-fastmcp_server = FastMCPServer(router=mcp_router)
-
 snowflake_connector = SnowflakeCortexConnector(
     allowed_roles=["ai_platform_reader", "analyst", "data_engineer"],
     allowed_schemas=["PORTFOLIO_GOLD", "CORTEX_DOCS"],
@@ -64,8 +69,19 @@ snowflake_connector.seed_default_corpus()
 
 informatica_adapter = InformaticaCloudTaskflowAdapter(min_rows_threshold=10, max_lag_minutes=30)
 postgres_connector = PostgresEnterpriseConnector()
+vsm_connector = ValueStreamManagementConnector()
+fastmcp_server = FastMCPServer(
+    version="2.2.0",
+    router=mcp_router,
+    connectors={
+        "snowflake": snowflake_connector,
+        "informatica": informatica_adapter,
+        "postgres": postgres_connector,
+        "vsm": vsm_connector,
+    },
+)
 bedrock_adapter = BedrockAgentCoreAdapter(
-    model_id="anthropic.claude-3-5-sonnet-20241022-v2:0",
+    model_id="anthropic.claude-sonnet-4-20250514",
     max_retries=2,
 )
 telemetry_monitor = ProductionTelemetryMonitor(token_budget_per_use_case=5_000)
@@ -74,18 +90,18 @@ telemetry_monitor = ProductionTelemetryMonitor(token_budget_per_use_case=5_000)
 telemetry_monitor.record_span(
     span_name="mcp.router.route_by_query",
     use_case="advisor_rag_assistant",
-    latency_ms=1.85,
+    latency_ms=0.92,
     status="OK",
     prompt_tokens=180,
     completion_tokens=45,
 )
 telemetry_monitor.record_span(
-    span_name="mcp.tool.snowflake_cortex_search",
-    use_case="advisor_rag_assistant",
-    latency_ms=138.4,
+    span_name="mcp.vsm.analyze_management_concerns",
+    use_case="vsm_portfolio_copilot",
+    latency_ms=42.6,
     status="OK",
-    prompt_tokens=620,
-    completion_tokens=210,
+    prompt_tokens=410,
+    completion_tokens=215,
 )
 mcp_router.create_hitl_interrupt(
     tool_name="postgres.execute_outbound_wire",
@@ -107,8 +123,9 @@ def health_check() -> Dict[str, Any]:
     """Returns service health, registered tool count, and active governance status."""
     return {
         "status": "healthy",
+        "version": "2.2.0",
         "service": "enterprise-mcp-router",
-        "protocol": "FastMCP / JSON-RPC 2.0",
+        "protocol": "FastMCP / JSON-RPC 2.0 + SSE",
         "total_registered_tools": len(mcp_router.tools),
         "domains": sorted({t.domain for t in mcp_router.tools.values()}),
         "pending_hitl_tickets": sum(
@@ -124,9 +141,32 @@ def mcp_jsonrpc_endpoint(req: MCPJsonRpcRequest) -> Dict[str, Any]:
     return fastmcp_server.handle_jsonrpc(req.model_dump())
 
 
+@app.post("/mcp/messages")
+def mcp_messages_endpoint(req: MCPJsonRpcRequest) -> Dict[str, Any]:
+    """MCP HTTP+SSE message dispatch endpoint."""
+    return fastmcp_server.handle_jsonrpc(req.model_dump())
+
+
+@app.get("/mcp/sse")
+def mcp_sse_endpoint() -> StreamingResponse:
+    """MCP Server-Sent Events (SSE) endpoint advertising message transport and capabilities."""
+    def _event_stream() -> Iterator[str]:
+        yield "event: endpoint\ndata: /mcp/messages\n\n"
+        capabilities_payload = json.dumps(
+            {
+                "serverInfo": {"name": fastmcp_server.name, "version": fastmcp_server.version},
+                "totalTools": len(mcp_router.tools),
+                "domains": sorted({t.domain for t in mcp_router.tools.values()}),
+            }
+        )
+        yield f"event: capabilities\ndata: {capabilities_payload}\n\n"
+
+    return StreamingResponse(_event_stream(), media_type="text/event-stream")
+
+
 @app.post("/api/v1/router/search")
 def semantic_route_tools(req: SemanticRouteRequest) -> Dict[str, Any]:
-    """Routes natural language intent to top-k MCP tools and reports token reduction."""
+    """Routes natural language intent to top-k MCP tools via BM25 + 64-dim dense RRF scoring."""
     res = mcp_router.route_by_query(
         query=req.query,
         k=req.top_k,
@@ -153,9 +193,18 @@ def authorize_tool_call(
     return mcp_router.authorize_execution(
         tool_name=req.tool_name,
         user_roles=user_roles,
-        hitl_approved=False,  # External callers must supply an approved ticket_id for mutations
+        hitl_approved=False,  # External callers must supply an approved hitl_ticket_id for mutations
         hitl_ticket_id=req.hitl_ticket_id,
         require_ticket=True,
+    )
+
+
+@app.post("/api/v1/governance/validate-schema")
+def validate_tool_schema(req: SchemaValidationRequest) -> Dict[str, Any]:
+    """Validates tool arguments against the tool's registered JSON Schema Draft-07 contract."""
+    return mcp_router.validate_tool_arguments(
+        tool_name=req.tool_name,
+        arguments=req.arguments,
     )
 
 
@@ -180,6 +229,7 @@ def create_hitl_ticket(
         user_roles=user_roles,
         arguments=req.arguments,
         justification=req.justification,
+        ttl_seconds=req.ttl_seconds,
     )
 
 
@@ -187,7 +237,7 @@ def create_hitl_ticket(
 def resolve_hitl_ticket(
     req: HITLResolutionRequest,
     principal: AuthenticatedPrincipal = Depends(get_current_principal),
-) -> Dict[str, Any]:
+) -> Any:
     """Approves or rejects a pending Human-in-the-Loop (HITL) interrupt ticket."""
     reviewer = principal.username if principal.is_authenticated else req.reviewer
     reviewer_roles = principal.roles if principal.is_authenticated else ["platform_admin"]
@@ -203,12 +253,47 @@ def resolve_hitl_ticket(
         reason = result.get("reason", "")
         if "prohibited" in reason or "not_authorized" in reason:
             return JSONResponse(status_code=403, content=result)
-        elif "not_found" in reason:
+        if "not_found" in reason:
             return JSONResponse(status_code=404, content=result)
-        elif "expired" in reason:
+        if "expired" in reason:
             return JSONResponse(status_code=410, content=result)
         return JSONResponse(status_code=400, content=result)
     return result
+
+
+@app.get("/api/v1/vsm/overview")
+def get_vsm_overview(portfolio_id: Optional[str] = None) -> Dict[str, Any]:
+    """Returns connected product portfolios, OKRs, and engineering work tickets."""
+    return vsm_connector.get_overview(portfolio_id=portfolio_id)
+
+
+@app.post("/api/v1/vsm/query")
+def query_vsm_relational(req: VSMSqlQueryRequest) -> Dict[str, Any]:
+    """Executes read-only relational SQL queries across product portfolios, OKRs, and tickets."""
+    return vsm_connector.query_vsm_sql(sql=req.sql, role=req.role, params=req.params)
+
+
+@app.post("/api/v1/vsm/analyze-concerns")
+def analyze_vsm_concerns(req: VSMConcernRequest) -> Dict[str, Any]:
+    """Detects management concerns across OKRs, portfolios & tickets and recommends governed MCP actions."""
+    t0 = time.perf_counter()
+    res = vsm_connector.analyze_management_concerns(
+        query=req.query,
+        portfolio_id=req.portfolio_id,
+        router=mcp_router,
+        bedrock_adapter=bedrock_adapter,
+    )
+    elapsed_ms = round(max(0.01, (time.perf_counter() - t0) * 1000.0), 2)
+    usage = (res.get("bedrock_validation") or {}).get("usage", {})
+    telemetry_monitor.record_span(
+        span_name="mcp.vsm.analyze_management_concerns",
+        use_case="vsm_portfolio_copilot",
+        latency_ms=elapsed_ms,
+        status="OK",
+        prompt_tokens=int(usage.get("prompt_tokens", 320)),
+        completion_tokens=int(usage.get("completion_tokens", 180)),
+    )
+    return res
 
 
 @app.post("/api/v1/connectors/snowflake/validate-sql")
@@ -239,13 +324,13 @@ def validate_informatica_taskflow(req: IICSTaskflowWebhookPayload) -> Dict[str, 
 
 @app.post("/api/v1/connectors/postgres/query")
 def query_postgres_ledger(req: PostgresQueryRequest) -> Dict[str, Any]:
-    """Executes read-only SQL query against the PostgreSQL institutional ledger."""
-    return postgres_connector.query_ledger(sql=req.sql, role=req.role)
+    """Executes read-only parameterized SQL query against the relational ledger."""
+    return postgres_connector.query_ledger(sql=req.sql, role=req.role, params=req.params)
 
 
 @app.post("/api/v1/connectors/postgres/snapshot/create")
 def create_postgres_snapshot(req: PostgresSnapshotRequest) -> Dict[str, Any]:
-    """Creates a point-in-time state snapshot of the PostgreSQL ledger."""
+    """Creates a point-in-time state snapshot of the relational ledger."""
     return postgres_connector.create_snapshot(req.snapshot_name)
 
 
@@ -254,7 +339,7 @@ def restore_postgres_snapshot(
     req: PostgresSnapshotRequest,
     principal: AuthenticatedPrincipal = Depends(get_current_principal),
 ) -> Dict[str, Any]:
-    """Restores the PostgreSQL ledger to a verified point-in-time snapshot."""
+    """Restores the relational ledger to a verified point-in-time snapshot."""
     if not (principal.has_role("platform_admin") or "platform_admin" in principal.roles):
         raise HTTPException(status_code=403, detail="platform_admin_role_required_for_snapshot_restore")
     actor = principal.username if principal.is_authenticated else "platform_admin"
@@ -284,9 +369,11 @@ def invoke_bedrock_structured(req: BedrockStructuredInvokeRequest) -> Dict[str, 
         }
 
     routed = mcp_router.route_by_query(req.prompt, k=3)["routed_tools"]
-    result = bedrock_adapter.invoke_with_structured_output(
+    result = bedrock_adapter.invoke_converse_live_or_sim(
+        prompt=req.prompt,
         required_keys=req.required_keys,
-        provider_fn=simulated_bedrock_provider,
+        tools=routed,
+        fallback_fn=simulated_bedrock_provider,
     )
     result["bedrock_converse_tool_config"] = bedrock_adapter.format_converse_tool_config(routed)
     return result
@@ -296,7 +383,7 @@ def invoke_bedrock_structured(req: BedrockStructuredInvokeRequest) -> Dict[str, 
 def get_framework_bridge(framework: str) -> Dict[str, Any]:
     """Exports top routed MCP tools into LangGraph, smolagents, or CrewAI schemas."""
     sample_tools = mcp_router.route_by_query(
-        "Snowflake Cortex Search, Informatica ELT, and PostgreSQL ledger", k=4
+        "Value Stream OKR management concerns, Snowflake Cortex Search, and PostgreSQL ledger", k=4
     )["routed_tools"]
     fw = framework.lower()
     if fw == "langgraph":

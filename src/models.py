@@ -36,7 +36,10 @@ class RoutedToolItem(BaseModel):
     is_mutating: bool
     required_role: str
     similarity_score: float
+    dense_score: Optional[float] = None
+    bm25_score: Optional[float] = None
     schema_tokens: int
+    input_schema: Optional[Dict[str, Any]] = None
 
 
 class SemanticRouteResponse(BaseModel):
@@ -64,6 +67,7 @@ class HITLCreateRequest(BaseModel):
     user_roles: List[str] = Field(default_factory=lambda: ["platform_admin"])
     arguments: Dict[str, Any] = Field(default_factory=dict)
     justification: str = Field(default="Automated S&OP / treasury rebalance execution")
+    ttl_seconds: int = Field(default=1800, ge=-3600, le=86400, description="Ticket expiration TTL in seconds")
 
 
 class HITLResolutionRequest(BaseModel):
@@ -138,3 +142,32 @@ class TelemetrySpanRequest(BaseModel):
 class RunbookLookupRequest(BaseModel):
     incident_type: str = Field(default="iics_taskflow_failed")
     component: str = Field(default="Informatica_Snowflake_ELT")
+
+
+class SchemaValidationRequest(BaseModel):
+    tool_name: str = Field(..., description="Target registered MCP tool name")
+    arguments: Dict[str, Any] = Field(default_factory=dict, description="Invocation arguments to validate")
+
+
+class VSMConcernRequest(BaseModel):
+    query: str = Field(
+        default="Identify management concerns across OKRs, product portfolios, and blocked engineering tickets and suggest actions",
+        description="Natural language steering or risk question for the VSM Copilot",
+    )
+    portfolio_id: Optional[str] = Field(default=None, description="Optional target product portfolio ID (e.g. PF-101)")
+
+
+class VSMSqlQueryRequest(BaseModel):
+    sql: str = Field(
+        default=(
+            "SELECT p.portfolio_id, p.name, o.okr_id, o.objective, o.status, "
+            "COUNT(t.ticket_id) AS blocked_tickets "
+            "FROM product_portfolios p "
+            "JOIN objectives_okrs o ON p.portfolio_id = o.portfolio_id "
+            "LEFT JOIN engineering_tickets t ON o.okr_id = t.okr_id AND t.status = 'BLOCKED' "
+            "GROUP BY p.portfolio_id, o.okr_id"
+        ),
+        description="Read-only relational SQL query across product_portfolios, objectives_okrs, and engineering_tickets",
+    )
+    params: List[Any] = Field(default_factory=list)
+    role: str = Field(default="analyst")

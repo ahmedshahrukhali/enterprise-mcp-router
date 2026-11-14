@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "enterprise-mcp-router"
-version = "2.1.0"
-description = "Enterprise Model Context Protocol (FastMCP / JSON-RPC 2.0) Server, 105-Tool Semantic Router, RBAC/HITL Governance Gate, Cloud Data Connectors (Snowflake Cortex, Informatica IICS, PostgreSQL), and Amazon Bedrock / AgentCore Observability."
+version = "2.2.0"
+description = "Enterprise Model Context Protocol (FastMCP / JSON-RPC 2.0 + SSE) Server, 120-Tool Hybrid BM25+Dense Router, RBAC/JSON Schema/HITL Governance Gate, Value Stream Management (OKRs, Portfolios, Engineering Tickets), Cloud Data Connectors (Snowflake Cortex, Informatica IICS, SQLite/PostgreSQL), and Amazon Bedrock Observability."
 readme = "README.md"
 license = {text = "MIT"}
 requires-python = ">=3.10"

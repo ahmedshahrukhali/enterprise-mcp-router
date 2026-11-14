@@ -57,6 +57,10 @@ class BaseStateStore(ABC):
     def get_spans(self, limit: int = 100) -> List[Dict[str, Any]]:
         pass
 
+    def close(self) -> None:
+        """Closes underlying storage handles when applicable."""
+        return None
+
 
 class SQLiteStateStore(BaseStateStore):
     """
@@ -218,6 +222,10 @@ class SQLiteStateStore(BaseStateStore):
         with self._lock:
             cur = self._conn.execute("SELECT data_json FROM telemetry_spans ORDER BY rowid DESC LIMIT ?;", (limit,))
             return [json.loads(r["data_json"]) for r in cur.fetchall()]
+
+    def close(self) -> None:
+        with self._lock:
+            self._conn.close()
 
 
 class InMemoryStateStore(BaseStateStore):

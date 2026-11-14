@@ -2,29 +2,29 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
-[![FastMCP / JSON-RPC 2.0](https://img.shields.io/badge/Protocol-FastMCP%20%7C%20JSON--RPC%202.0-0ea5e9.svg)]()
-[![FastAPI](https://img.shields.io/badge/FastAPI-2.1-009688.svg)](https://fastapi.tiangolo.com/)
-[![Tests Passing](https://img.shields.io/badge/tests-21%20passed-brightgreen.svg)]()
+[![FastMCP / JSON-RPC 2.0 + SSE](https://img.shields.io/badge/Protocol-FastMCP%20%7C%20JSON--RPC%202.0%20%2B%20SSE-0ea5e9.svg)]()
+[![FastAPI](https://img.shields.io/badge/FastAPI-2.2-009688.svg)](https://fastapi.tiangolo.com/)
+[![Tests Passing](https://img.shields.io/badge/tests-31%20passed-brightgreen.svg)]()
 
-**A routing and governance gateway that sits between AI agents (Claude, GPT, open-weight models) and internal company databases, data pipelines, and APIs.**
+**A routing and governance gateway that sits between AI agents (Claude Sonnet on Amazon Bedrock, GPT, open-weight models) and internal company databases, value stream management systems, data pipelines, and APIs.**
 
 ---
 
 ## Overview
 
-Connecting an AI agent to 5 tools in a local prototype is straightforward. Scaling that same agent to **100+ internal tools** across a company (Snowflake, Informatica, PostgreSQL, Jira, GitHub, ERP systems) usually breaks down in three places:
+Connecting an AI agent to 5 tools in a local prototype is straightforward. Scaling that same agent to **120+ internal tools** across a company (Product Portfolios & OKRs, Jira/GitHub engineering tickets, Snowflake, Informatica, PostgreSQL, ERP systems) usually breaks down in three places:
 
 1. **Tool Schema Bloat in the Prompt:**
-   Whenever an LLM uses tool-calling, the full JSON Schema definition of *every* available tool has to be injected into the prompt context on every turn. With 100+ tools across multiple connectors, you burn **~15,000+ input tokens per message** just listing tool definitions—and models start picking the wrong tool when descriptions overlap.
-   * **What this repo does:** Before calling the model, the router runs a fast hybrid search over the 105 registered tools and passes **only the top-$k$ relevant tool schemas** for that turn.
+   Whenever an LLM uses tool-calling, the full JSON Schema definition of *every* available tool has to be injected into the prompt context on every turn. With 120+ tools across 8 enterprise domains, you burn **~18,000+ input tokens per message** just listing tool definitions—and models start picking the wrong tool when descriptions overlap.
+   * **What this repo does:** Before calling the model, the router runs a **hybrid Okapi BM25 + 64-dim feature-hashed dense embedding search with Reciprocal Rank Fusion (RRF)** over the 120 registered tools and passes **only the top-$k$ relevant tool schemas** for that turn.
 
-2. **Unchecked Write Access to Production Systems:**
-   Reading a report is safe; executing an outbound bank wire, running a `DROP TABLE` query, or triggering a production deployment without human sign-off is not.
-   * **What this repo does:** Every tool call passes through a role check (**RBAC**). Read-only tools run immediately, SQL queries are parsed using an **AST Safe SQL Guard (`sqlglot`)** to block destructive commands (`DROP`, `DELETE`, `UPDATE`, `SELECT ... INTO`), and any tool marked as mutating pauses execution and queues a **Human-in-the-Loop (HITL) approval ticket** with separation-of-duties enforcement and single-use replay prevention.
+2. **Unchecked Write Access & Malformed Tool Arguments:**
+   Reading a report is safe; executing an outbound bank wire, reallocating portfolio FTE capacity, running a `DROP TABLE` or `SELECT ... INTO` query, or passing invalid arguments without human sign-off is not.
+   * **What this repo does:** Every tool call passes through deterministic **JSON Schema Draft-07 contract validation** (`-32602` on mismatch), API key / RBAC role verification (`src/security.py`), **AST-based Read-Only SQL guarding via `sqlglot`** (`src/connectors/sql_guard.py`) plus `sqlite3.set_authorizer` protection, and **HITL approval queues** with separation-of-duties (no self-approval), TTL expiration, single-use replay prevention, and **SQLite ACID persistence** (`src/storage.py`). See [SECURITY.md](SECURITY.md).
 
-3. **Querying Stale or Broken Data Pipelines:**
-   If an upstream ETL/ELT job (like Informatica Cloud $\rightarrow$ Snowflake) fails overnight, an AI agent won't know—it will confidently answer questions using stale or empty staging tables.
-   * **What this repo does:** It validates upstream pipeline status, row counts, and freshness SLAs before unlocking downstream RAG retrieval, and logs OpenTelemetry trace spans, per-use-case token budgets, and L2 troubleshooting runbooks.
+3. **Disconnected Management Data & Stale Pipelines:**
+   Engineering and product teams track OKRs, portfolios, and engineering tickets across siloed tools, while upstream ELT jobs (Informatica Cloud $\rightarrow$ Snowflake) can fail overnight.
+   * **What this repo does:** The **Value Stream Management (VSM) Connector** joins connected `product_portfolios`, `objectives_okrs`, and `engineering_tickets` in a relational SQLite3 store, uses **Claude Sonnet (`BedrockAgentCoreAdapter`)** to identify management concerns (OKR drift, blocked critical-path tickets, capacity overload) and recommend HITL-governed MCP actions, and validates upstream IICS ELT SLAs alongside W3C `traceparent` OpenTelemetry spans and L2 runbooks.
 
 ---
 
@@ -32,20 +32,21 @@ Connecting an AI agent to 5 tools in a local prototype is straightforward. Scali
 
 ```
 User / Agent Question
-   │  "Check Fidelity RRSP rules in Snowflake and get fund NAV"
+   │  "Identify management concerns across at-risk OKRs, portfolios, and blocked tickets"
    ▼
-1. Semantic Router ──▶ Scores 105 registered tools across 7 connectors (<2ms)
-   │                    and passes only the top-k tool schemas to the LLM prompt
+1. Hybrid Router       ──▶ Okapi BM25 + 64-dim Dense + RRF scores 120 tools across 8 domains
+   │                       and passes only the top-k tool schemas to the LLM prompt
    ▼
-2. Permission Gate ──▶ Checks caller RBAC role. Does the tool modify data?
-   │                    ├─ No (Read-Only) ──▶ Validates SQL AST & executes tool immediately
-   │                    └─ Yes (Mutating) ──▶ Pauses & queues a Human Approval Ticket (TTL + anti-replay)
+2. Contract & RBAC Gate──▶ Validates JSON Schema (-32602), API Key/RBAC, & HITL separation-of-duties
+   │                       ├─ Read-Only & Authorized ──▶ Executes SQL AST check & runs tool
+   │                       └─ Mutating ──▶ Pauses & persists HITL Ticket (TTL + single-use lock)
    ▼
-3. Safe Connectors ──▶ Snowflake (AST SELECT-only guard & Cortex Search)
-   │                   Informatica IICS (ELT freshness & row-count gate)
-   │                   PostgreSQL (AST-governed ledger & 1-click table snapshots)
+3. Safe Connectors     ──▶ Value Stream Management (SQLite3 JOINs across Portfolios, OKRs, Tickets)
+   │                       PostgreSQL / SQLite3 Ledger (sqlglot AST guard, authorizer & snapshots)
+   │                       Snowflake (sqlglot AST SELECT-only guard & Cortex Search)
+   │                       Informatica IICS (ELT freshness & row-count gate)
    ▼
-4. Trace & Alerts  ──▶ Logs W3C traceparent spans, token budgets, and L2 runbooks
+4. Trace & Alerts      ──▶ Logs W3C traceparent spans, token budgets, and L2 runbooks
 ```
 
 ---
@@ -57,70 +58,32 @@ git clone https://github.com/ahmedshahrukhali/enterprise-mcp-router.git
 cd enterprise-mcp-router
 pip install -r requirements.txt
 
-# 1. Launch the interactive web control plane at http://localhost:8000 (OpenAPI docs at /docs)
+# 1. Launch the interactive 6-tab web control plane at http://localhost:8000 (OpenAPI docs at /docs)
 uvicorn src.main:app --reload --port 8000
 
 # 2. Run the terminal benchmark & simulation runner
 python run_demo.py
 
-# 3. Run the 21 automated unit, security, and recall benchmark tests
+# 3. Run the automated unit & API test suite
 pytest -v
 ```
 
 ---
 
-## Architecture & Security Defenses
+## What's Inside the Interactive Dashboard (`http://localhost:8000`)
 
-### 1. AST-Based Read-Only SQL Guard (`src/connectors/sql_guard.py`)
-Rather than relying on brittle regex pattern-matching, queries are parsed into Abstract Syntax Trees using `sqlglot` across both **Snowflake** and **PostgreSQL** dialects:
-* **Allowed:** Pure `SELECT` and `UNION` statements, including Common Table Expressions (`WITH ... SELECT ...`), comments (`--` and `/* ... */`), and semicolons safely contained inside string literals (`WHERE memo = 'run 1; run 2'`).
-* **Blocked:** DDL/DML mutations (`DROP`, `DELETE`, `UPDATE`, `INSERT`, `ALTER`, `TRUNCATE`), subclause bypasses (`SELECT ... INTO new_table`), stacked multi-statements (`SELECT 1; DROP TABLE foo`), and unauthorized schema access.
-
-### 2. Human-in-the-Loop (HITL) Governance & Separation of Duties
-* **Separation of Duties:** Requesters are strictly prohibited from approving their own tickets (`self_approval_prohibited`).
-* **Approver Authorization:** Only reviewers holding `platform_admin` or `super_admin` roles can approve or reject interrupt tickets.
-* **TTL Expiration:** Tickets carry an expiration timestamp (default: 30 minutes). Expired tickets transition to `EXPIRED` and cannot be approved or executed.
-* **Single-Use Replay Prevention:** Once a ticket is consumed to authorize tool execution, its status transitions to `CONSUMED`. Replaying the same ticket ID is rejected.
-* **No Direct Bypass:** Mutating MCP tools cannot be executed via public API endpoints by setting boolean flags (`hitl_approved=True`); authorization requires a valid, unconsumed ticket ID.
-
-### 3. Persistent & Bounded Storage (`src/storage.py`)
-* **SQLite Persistence (`SQLiteStateStore`):** Full ACID persistence with WAL journaling for tickets, audit events, ledger snapshots, and telemetry spans across worker reloads.
-* **Bounded In-Memory Queues (`InMemoryStateStore`):** Thread-safe ring buffers using bounded `deque`s for audit trails and trace spans to guarantee zero memory leaks under high throughput.
-
----
-
-## Production Implementations vs. Simulated Components
-
-To enable zero-setup local demonstration without requiring paid cloud infrastructure, some connectors simulate cloud backends:
-
-| Component | Status | Description |
-|---|---|---|
-| **Semantic Router & Catalog** | **Production-Ready** | 105-tool catalog, dense cosine + keyword router, prompt token profiler |
-| **FastMCP Server & JSON-RPC** | **Production-Ready** | FastMCP `@mcp.tool()` registration, JSON-RPC 2.0 dispatch, RBAC validation |
-| **AST Safe SQL Guard** | **Production-Ready** | Full AST parser via `sqlglot` for Snowflake and PostgreSQL |
-| **HITL Governance Engine** | **Production-Ready** | Stateful approval queue, TTL expiry, anti-replay, separation-of-duties |
-| **State Storage (SQLite)** | **Production-Ready** | Thread-safe SQLite ACID persistence and bounded in-memory queues |
-| **Snowflake Cortex Search** | *Simulated Mock* | Demonstrates hybrid keyword/vector search over in-memory compliance chunks |
-| **Informatica IICS Taskflow** | *Simulated Mock* | Demonstrates webhook validation, freshness lag checks, and RAG sync locks |
-| **PostgreSQL Ledger** | *Simulated Mock* | Demonstrates in-memory transactional ledger with instant rollback snapshots |
-| **Bedrock Converse Adapter** | *Simulated Mock* | Demonstrates self-healing retry loop when LLM output misses required JSON keys |
+* **Tab 1 — Semantic Tool Router (`120 -> Top-k`):** Type any plain-English task (or click a preset) and inspect the hybrid **BM25 + 64-dim Dense + Fused** scores and prompt schema token reduction.
+* **Tab 2 — Value Stream & OKR Copilot (VSM):** Inspect connected Product Portfolios, OKRs, and blocked Engineering Work Tickets, trigger **Identify Management Concerns & Suggest Actions (Claude Sonnet)**, run relational `JOIN` SQL queries, and queue recommended actions directly into the HITL gate.
+* **Tab 3 — RBAC, Schema Contract & Human Approval Queue:** Validate JSON Schema contracts, test role permissions (`analyst`, `ai_platform_reader`, `data_engineer`, `platform_admin`), and approve or reject queued agent actions.
+* **Tab 4 — Data Connectors (Snowflake, Informatica, SQLite3/Postgres):** Test the literal-safe read-only SQL filter against `DROP TABLE` injection, check Informatica ELT pipeline SLAs, run relational `GROUP BY` ledger queries, and test transactional snapshots/rollbacks.
+* **Tab 5 — Bedrock Claude Sonnet & Framework Bridges:** Export routed tools directly into **Amazon Bedrock (`toolConfig`)**, **LangGraph (`ToolNode`)**, **Hugging Face `smolagents`**, or **CrewAI**, and test automatic retry when a model output misses a required JSON field.
+* **Tab 6 — Telemetry & Runbooks:** Inspect W3C `traceparent` spans, per-use-case token budget alerts, and step-by-step L2 incident triage guides.
 
 ---
 
 ## Understanding the Token Savings & Routing Tradeoff
 
-In standard LLM tool-calling, every tool in your registry adds roughly **140–160 tokens** of JSON Schema metadata (`name`, `description`, parameter types, enums) to the system prompt on every turn. Across 105 tools in 7 domains, sending the full catalog costs **15,878 tokens per turn** before the user even says hello.
-
-By filtering the catalog down to the **top-$k$ tools** matching the user's intent, we avoid sending irrelevant connector schemas (for example, omitting DevOps and CRM tool schemas when the user asks a Snowflake finance question):
-
-| Routed Subset ($k$) | Full Catalog Schema Tokens | Routed Schema Tokens | Prompt Schema Reduction | Router Latency | Recommended Use Case |
-|---|---|---|---|---|---|
-| **Top-3 Tools** | 15,878 tokens | **472 tokens** | **97.0%** | 1.6 ms | Single-domain lookups (e.g., pure SQL or doc search) |
-| **Top-5 Tools (Default)** | 15,878 tokens | **758 tokens** | **95.2%** | 1.8 ms | Standard single- or two-step agent turns |
-| **Top-8 Tools** | 15,878 tokens | **1,218 tokens** | **92.3%** | 2.0 ms | Cross-connector workflows (e.g., Informatica + Snowflake) |
-| **Top-10 Tools** | 15,878 tokens | **1,520 tokens** | **90.4%** | 2.1 ms | Broad multi-hop investigation across 3+ systems |
-
-> **Design Note on Recall vs. Context Size:** Because aggressive filtering ($k=3$) can occasionally miss a secondary tool needed for a multi-system query, `top_k` is configurable per request (`1` to `25`) and supports optional `domain_filter` scoping or full catalog listing via the MCP `tools/list` endpoint. Automated benchmark tests (`tests/test_router_recall.py`) verify 100% Top-1 and Top-3 recall on standard domain intents.
+Across **120 tools in 8 domains** (`snowflake`, `informatica`, `postgres`, `devops`, `supply_chain`, `crm_rest`, `knowledge_graph`, `portfolio_vsm`), sending the full catalog costs **~18,000+ tokens per turn** before the user even asks a question. Filtering down to top-$k$ tools via Okapi BM25 + 64-dim dense hybrid RRF typically reduces prompt schema overhead by **90%–97%** (`top_k` configurable from `1` to `25`, plus `domain_filter` or full MCP `tools/list` inspection).
 
 ---
 

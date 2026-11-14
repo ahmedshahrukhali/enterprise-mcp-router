@@ -1,5 +1,5 @@
 """
-FastAPI REST & JSON-RPC 2.0 Integration Tests for Enterprise-MCP-Router.
+FastAPI REST, JSON-RPC 2.0 & SSE Integration Tests for Enterprise-MCP-Router.
 """
 
 from fastapi.testclient import TestClient
@@ -12,12 +12,14 @@ def test_dashboard_and_health_endpoints():
     resp_html = client.get("/")
     assert resp_html.status_code == 200
     assert "Enterprise-MCP-Router" in resp_html.text
+    assert "Value Stream" in resp_html.text
 
     resp_health = client.get("/health")
     assert resp_health.status_code == 200
     body = resp_health.json()
     assert body["status"] == "healthy"
-    assert body["total_registered_tools"] == 105
+    assert body["total_registered_tools"] == 120
+    assert "portfolio_vsm" in body["domains"]
 
 
 def test_mcp_jsonrpc_protocol_endpoint():
@@ -36,6 +38,14 @@ def test_mcp_jsonrpc_protocol_endpoint():
     assert payload["result"]["tools"][0]["domain"] == "informatica"
 
 
+def test_mcp_sse_transport_endpoint():
+    resp = client.get("/mcp/sse")
+    assert resp.status_code == 200
+    assert "text/event-stream" in resp.headers["content-type"]
+    assert "event: endpoint" in resp.text
+    assert "/mcp/messages" in resp.text
+
+
 def test_semantic_router_and_governance_endpoints():
     route_resp = client.post(
         "/api/v1/router/search",
@@ -43,8 +53,17 @@ def test_semantic_router_and_governance_endpoints():
     )
     assert route_resp.status_code == 200
     r_data = route_resp.json()
-    assert r_data["total_registered_tools"] == 105
+    assert r_data["total_registered_tools"] == 120
     assert r_data["token_reduction_pct"] > 90.0
+    assert "bm25_score" in r_data["routed_tools"][0]
+
+    # Validate JSON Schema contract check endpoint
+    bad_schema_resp = client.post(
+        "/api/v1/governance/validate-schema",
+        json={"tool_name": "postgres.execute_outbound_wire", "arguments": {"amount_usd": -5}},
+    )
+    assert bad_schema_resp.status_code == 200
+    assert bad_schema_resp.json()["valid"] is False
 
     # Create and resolve HITL interrupt ticket via API
     create_resp = client.post(
@@ -53,7 +72,7 @@ def test_semantic_router_and_governance_endpoints():
             "tool_name": "postgres.execute_outbound_wire",
             "requested_by": "test_suite_agent",
             "user_roles": ["platform_admin"],
-            "arguments": {"amount_usd": 10000},
+            "arguments": {"from_account": "ACC-9001", "to_account": "ACC-9003", "amount_usd": 10000},
         },
     )
     assert create_resp.status_code == 200
@@ -80,6 +99,40 @@ def test_semantic_router_and_governance_endpoints():
     )
     assert auth_resp.status_code == 200
     assert auth_resp.json()["allowed"] is True
+
+
+def test_vsm_overview_query_and_concern_analysis_endpoints():
+    ov_resp = client.get("/api/v1/vsm/overview")
+    assert ov_resp.status_code == 200
+    ov_data = ov_resp.json()
+    assert ov_data["summary"]["total_portfolios"] == 4
+    assert ov_data["summary"]["blocked_tickets_count"] == 3
+
+    sql_resp = client.post(
+        "/api/v1/vsm/query",
+        json={
+            "sql": (
+                "SELECT p.portfolio_id, COUNT(t.ticket_id) AS blocked_count "
+                "FROM product_portfolios p "
+                "JOIN engineering_tickets t ON p.portfolio_id = t.portfolio_id "
+                "WHERE t.status = 'BLOCKED' GROUP BY p.portfolio_id"
+            ),
+            "role": "analyst",
+        },
+    )
+    assert sql_resp.status_code == 200
+    assert sql_resp.json()["status"] == "ok"
+    assert sql_resp.json()["row_count"] >= 2
+
+    concern_resp = client.post(
+        "/api/v1/vsm/analyze-concerns",
+        json={"query": "Identify blocked engineering tickets impacting OKRs", "portfolio_id": "PF-101"},
+    )
+    assert concern_resp.status_code == 200
+    c_data = concern_resp.json()
+    assert c_data["status"] == "ok"
+    assert c_data["concerns_count"] >= 2
+    assert c_data["bedrock_validation"]["status"] == "success"
 
 
 def test_connectors_adapters_and_telemetry_endpoints():
@@ -115,10 +168,10 @@ def test_connectors_adapters_and_telemetry_endpoints():
 
     pg_resp = client.post(
         "/api/v1/connectors/postgres/query",
-        json={"sql": "SELECT * FROM accounts WHERE risk_tier = 'LOW'", "role": "analyst"},
+        json={"sql": "SELECT * FROM accounts WHERE risk_tier = ?", "params": ["LOW"], "role": "analyst"},
     )
     assert pg_resp.status_code == 200
-    assert pg_resp.json()["row_count"] >= 1
+    assert pg_resp.json()["row_count"] == 2
 
     bd_resp = client.post(
         "/api/v1/adapters/bedrock/invoke",
@@ -146,3 +199,47 @@ def test_connectors_adapters_and_telemetry_endpoints():
     )
     assert rb_resp.status_code == 200
     assert "Cortex Search" in rb_resp.json()["triage_steps"]
+
+
+def test_mcp_messages_endpoint_and_builtin_vsm_tools_call():
+    resp = client.post(
+        "/mcp/messages",
+        json={
+            "jsonrpc": "2.0",
+            "id": 77,
+            "method": "tools/call",
+            "params": {
+                "name": "portfolio_vsm.detect_management_concerns",
+                "user_roles": ["analyst"],
+                "arguments": {"portfolio_id": "PF-101"},
+            },
+        },
+    )
+    assert resp.status_code == 200
+    payload = resp.json()
+    assert payload["result"]["isError"] is False
+    tool_out = payload["result"]["content"][0]["json"]
+    assert tool_out["status"] == "ok"
+    assert tool_out["concerns_count"] >= 2
+
+
+def test_rbac_denial_and_jsonrpc_32001():
+    resp = client.post(
+        "/mcp/jsonrpc",
+        json={
+            "jsonrpc": "2.0",
+            "id": 88,
+            "method": "tools/call",
+            "params": {
+                "name": "postgres.execute_outbound_wire",
+                "user_roles": ["analyst"],
+                "hitl_approved": True,
+                "arguments": {"from_account": "ACC-9001", "to_account": "ACC-9003", "amount_usd": 500.0},
+            },
+        },
+    )
+    assert resp.status_code == 200
+    err = resp.json()["error"]
+    assert err["code"] == -32001
+    assert err["data"]["reason"] == "rbac_denied"
+

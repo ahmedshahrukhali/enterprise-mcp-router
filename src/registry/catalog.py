@@ -1,6 +1,7 @@
 """
-Deterministic 105-Tool Enterprise Model Context Protocol (MCP) Catalog.
-Spans 7 enterprise domains:
+Deterministic 120-Tool Enterprise Model Context Protocol (MCP) Catalog,
+64-Dimensional Feature-Hashed Dense Embeddings, and Okapi BM25 Lexical Index.
+Spans 8 enterprise domains:
   1. snowflake      (Snowflake Cortex Search, Read-Only Warehouses, FinOps)
   2. informatica    (Informatica Cloud IICS Taskflows, Mappings, ELT SLAs)
   3. postgres       (PostgreSQL Transactional Ledger, Snapshots, Audit Logs)
@@ -8,10 +9,14 @@ Spans 7 enterprise domains:
   5. supply_chain   (Kinaxis Maestro / S&OP Exceptions, Demand.AI SKU Forecasts)
   6. crm_rest       (REST API Gateways, Twilio Outreach, KYC/AML Compliance)
   7. knowledge_graph(Neo4j Cypher Traversal, Qdrant Hybrid Vector Retrieval)
+  8. portfolio_vsm  (Value Stream Management, OKRs, Product Portfolios & Engineering Tickets)
 """
 
+import hashlib
 import math
-from typing import Any, Dict, List
+import re
+from collections import Counter
+from typing import Any, Dict, Iterable, List, Tuple
 
 
 DOMAIN_KEYWORDS: Dict[str, List[str]] = {
@@ -43,6 +48,12 @@ DOMAIN_KEYWORDS: Dict[str, List[str]] = {
         "neo4j", "qdrant", "graph", "vector", "cypher", "embedding", "rerank",
         "chunk", "document", "policy", "compliance", "multihop", "entity", "rag",
     ],
+    "portfolio_vsm": [
+        "vsm", "okr", "okrs", "objective", "milestone", "velocity",
+        "bottleneck", "blocker", "concern", "epic", "initiative", "roadmap",
+        "throughput", "reallocate", "capacity", "sprint", "flow", "efficiency",
+        "stream",
+    ],
 }
 
 DOMAIN_ORDER = [
@@ -53,7 +64,16 @@ DOMAIN_ORDER = [
     "supply_chain",
     "crm_rest",
     "knowledge_graph",
+    "portfolio_vsm",
 ]
+
+_TOKEN_RE = re.compile(r"[a-z0-9]+")
+
+
+def tokenize_text(text: str) -> List[str]:
+    """Extracts normalized lowercase alphanumeric tokens for BM25 and hashing."""
+    normalized = text.replace("_", " ").replace(".", " ").replace("-", " ").replace("/", " ")
+    return [tok for tok in _TOKEN_RE.findall(normalized.lower()) if len(tok) > 1]
 
 
 def _normalize(vec: List[float]) -> List[float]:
@@ -65,44 +85,126 @@ def _normalize(vec: List[float]) -> List[float]:
 
 def compute_query_embedding(text: str) -> List[float]:
     """
-    Computes a deterministic 16-dimensional normalized dense semantic embedding
-    from query or tool description text across the 7 enterprise domains + action axes.
+    Computes a deterministic 64-dimensional L2-normalized dense semantic embedding:
+      - Dims 0..7   : Enterprise domain affinity across the 8 domains
+      - Dims 8..19  : 12 operational / semantic projection axes
+      - Dims 20..63 : Signed SHA-256 feature hashing over unigrams, bigrams & 4-char subwords
     """
-    tokens = [
-        t.strip(".,;:!?()[]{}\"'`").lower()
-        for t in text.replace("_", " ").replace(".", " ").replace("-", " ").split()
-    ]
+    tokens = tokenize_text(text)
     token_set = set(tokens)
 
-    # First 7 dimensions correspond to the 7 enterprise domains
+    # First 8 dimensions correspond to the 8 enterprise domains
     vec: List[float] = []
     for dom in DOMAIN_ORDER:
         kw_list = DOMAIN_KEYWORDS[dom]
         hits = sum(
-            1.5 if kw in token_set else (0.6 if len(kw) > 3 and any(kw in tok for tok in token_set) else 0.0)
+            1.6 if kw in token_set else (0.55 if len(kw) > 3 and any(kw in tok for tok in token_set) else 0.0)
             for kw in kw_list
         )
-        vec.append(hits + 0.05)
+        vec.append(hits + 0.04)
 
-    # Dimensions 7..15 capture operational semantics (read vs mutate, search, sql, alert, etc.)
-    read_terms = {"read", "get", "list", "select", "search", "query", "fetch", "inspect", "validate", "check"}
-    write_terms = {"execute", "update", "delete", "create", "trigger", "wire", "approve", "restore", "mutate", "write"}
-    sql_terms = {"sql", "table", "schema", "select", "ledger", "warehouse", "postgres", "snowflake"}
-    rag_terms = {"rag", "cortex", "vector", "graph", "qdrant", "neo4j", "chunk", "policy", "document"}
-    ops_terms = {"sla", "alert", "runbook", "telemetry", "trace", "lag", "status", "health", "audit"}
-    fin_terms = {"fund", "nav", "rrsp", "wire", "balance", "portfolio", "aum", "kyc", "aml", "risk"}
-    eng_terms = {"cve", "snyk", "jira", "github", "pr", "docker", "k8s", "argo", "build"}
-    scm_terms = {"sku", "forecast", "maestro", "demand", "inventory", "supplier", "order", "plant"}
-    etl_terms = {"iics", "informatica", "taskflow", "elt", "etl", "staging", "mapping", "ingest"}
+    # Dimensions 8..19 capture operational & domain semantics
+    semantic_groups = [
+        {"read", "get", "list", "select", "search", "query", "fetch", "inspect", "validate", "check"},
+        {"execute", "update", "delete", "create", "trigger", "wire", "approve", "restore", "mutate", "write", "reallocate"},
+        {"sql", "table", "schema", "select", "ledger", "warehouse", "postgres", "snowflake"},
+        {"rag", "cortex", "vector", "graph", "qdrant", "neo4j", "chunk", "policy", "document"},
+        {"sla", "alert", "runbook", "telemetry", "trace", "lag", "status", "health", "audit"},
+        {"fund", "nav", "rrsp", "wire", "balance", "portfolio", "aum", "kyc", "aml", "risk"},
+        {"cve", "snyk", "jira", "github", "pr", "docker", "k8s", "argo", "build"},
+        {"sku", "forecast", "maestro", "demand", "inventory", "supplier", "order", "plant"},
+        {"iics", "informatica", "taskflow", "elt", "etl", "staging", "mapping", "ingest"},
+        {"okr", "okrs", "vsm", "milestone", "capacity", "velocity", "bottleneck", "blocker", "concern", "epic", "sprint", "flow"},
+        {"rbac", "oauth2", "security", "compliance", "pii", "phi", "hitl", "governance", "soc2"},
+        {"aws", "bedrock", "claude", "sonnet", "azure", "gcp", "aks", "gke", "cloud"},
+    ]
+    for group in semantic_groups:
+        vec.append(float(len(token_set & group)) * 1.1 + 0.04)
 
-    for group in [read_terms, write_terms, sql_terms, rag_terms, ops_terms, fin_terms, eng_terms, scm_terms, etl_terms]:
-        vec.append(float(len(token_set & group)) + 0.05)
+    # Dimensions 20..63: 44-dim signed SHA-256 feature hashing over unigrams, bigrams & char 4-grams
+    hash_dims = 44
+    hashed = [0.0] * hash_dims
+    grams: List[Tuple[str, float]] = []
+    for tok in tokens:
+        grams.append((f"w:{tok}", 1.0))
+        if len(tok) >= 4:
+            for i in range(len(tok) - 3):
+                grams.append((f"c:{tok[i:i+4]}", 0.35))
+    for i in range(len(tokens) - 1):
+        grams.append((f"b:{tokens[i]}_{tokens[i+1]}", 0.8))
 
+    for gram, weight in grams:
+        digest = hashlib.sha256(gram.encode("utf-8")).digest()
+        bucket = int.from_bytes(digest[:2], "big") % hash_dims
+        sign = 1.0 if (digest[2] & 1) == 0 else -1.0
+        hashed[bucket] += sign * weight
+
+    vec.extend(hashed)
     return _normalize(vec)
 
 
-# 15 curated tools per domain * 7 domains = 105 Enterprise MCP Tools
-_DOMAIN_TOOL_TEMPLATES: Dict[str, List[ tuple[str, str, bool, str] ]] = {
+class OkapiBM25Index:
+    """
+    In-memory Okapi BM25 lexical retrieval index over registered MCP tool specifications.
+    Computes corpus IDF weights and length-normalized TF scoring without external dependencies.
+    """
+
+    def __init__(self, documents: Iterable[Tuple[str, str]], k1: float = 1.5, b: float = 0.75):
+        self.k1 = k1
+        self.b = b
+        self._doc_tf: Dict[str, Counter[str]] = {}
+        self._doc_len: Dict[str, int] = {}
+        self._df: Counter[str] = Counter()
+
+        for doc_id, text in documents:
+            tokens = tokenize_text(text)
+            tf = Counter(tokens)
+            self._doc_tf[doc_id] = tf
+            self._doc_len[doc_id] = len(tokens)
+            for term in tf.keys():
+                self._df[term] += 1
+
+        self.num_docs = len(self._doc_tf)
+        total_len = sum(self._doc_len.values())
+        self.avgdl = (total_len / self.num_docs) if self.num_docs > 0 else 1.0
+
+    def idf(self, term: str) -> float:
+        df = self._df.get(term, 0)
+        return math.log(1.0 + (self.num_docs - df + 0.5) / (df + 0.5))
+
+    def score_raw(self, query: str, doc_id: str) -> float:
+        tf_map = self._doc_tf.get(doc_id)
+        if not tf_map:
+            return 0.0
+        dl = self._doc_len[doc_id]
+        denom_norm = self.k1 * (1.0 - self.b + self.b * (dl / max(self.avgdl, 1e-9)))
+        total = 0.0
+        for term in set(tokenize_text(query)):
+            tf = tf_map.get(term, 0)
+            if tf == 0:
+                continue
+            idf_val = self.idf(term)
+            total += idf_val * ((tf * (self.k1 + 1.0)) / (tf + denom_norm))
+        return total
+
+    def score(self, query: str, doc_id: str) -> float:
+        """Returns normalized Okapi BM25 relevance score in [0.0, 1.0]."""
+        q_terms = set(tokenize_text(query))
+        if not q_terms:
+            return 0.0
+        raw = self.score_raw(query, doc_id)
+        if raw <= 0.0:
+            return 0.0
+        # Theoretical per-query ceiling: sum over query terms present in corpus
+        in_vocab_terms = [t for t in q_terms if self._df.get(t, 0) > 0]
+        if not in_vocab_terms:
+            return 0.0
+        max_theoretical = sum(self.idf(t) * (self.k1 + 1.0) for t in in_vocab_terms)
+        return round(min(1.0, raw / max(max_theoretical, 1e-9)), 4)
+
+
+# 15 curated tools per domain * 8 domains = 120 Enterprise MCP Tools
+_DOMAIN_TOOL_TEMPLATES: Dict[str, List[Tuple[str, str, bool, str]]] = {
     "snowflake": [
         ("snowflake.cortex_search_docs", "Search Snowflake Cortex Search vector index over compliance policies, RRSP rules, and fund prospectuses", False, "ai_platform_reader"),
         ("snowflake.execute_readonly_sql", "Execute governed read-only SELECT query on Snowflake PORTFOLIO_GOLD and CORTEX_DOCS schemas", False, "ai_platform_reader"),
@@ -222,12 +324,113 @@ _DOMAIN_TOOL_TEMPLATES: Dict[str, List[ tuple[str, str, bool, str] ]] = {
         ("knowledge_graph.merge_duplicate_graph_entities", "Execute entity resolution merge across duplicate nodes in Neo4j knowledge graph (mutating)", True, "data_engineer"),
         ("knowledge_graph.snapshot_vector_collection", "Create point-in-time Qdrant collection snapshot prior to bulk ingestion (mutating)", True, "data_engineer"),
     ],
+    "portfolio_vsm": [
+        ("portfolio_vsm.detect_management_concerns", "Analyze connected OKRs, product portfolios, and blocked engineering tickets to identify management concerns and suggest corrective actions", False, "analyst"),
+        ("portfolio_vsm.query_okr_alignment", "Query Objectives and Key Results (OKRs) progress, confidence scores, and strategic alignment across product portfolios", False, "analyst"),
+        ("portfolio_vsm.get_portfolio_health_summary", "Retrieve product portfolio budget utilization, R&D capacity allocation, flow efficiency, and cycle time metrics", False, "analyst"),
+        ("portfolio_vsm.list_blocked_engineering_tickets", "List blocked or high-aging Jira and GitHub engineering work tickets delaying portfolio milestones", False, "analyst"),
+        ("portfolio_vsm.compute_flow_efficiency_metrics", "Compute Value Stream Management (VSM) flow time, flow velocity, flow load, and wait-state bottlenecks", False, "analyst"),
+        ("portfolio_vsm.analyze_sprint_velocity_bottlenecks", "Correlate engineering ticket cycle times and PR review latency against team sprint capacity", False, "data_engineer"),
+        ("portfolio_vsm.check_epic_dependency_risks", "Traverse cross-team epic and engineering work ticket dependencies to flag critical-path slippage", False, "analyst"),
+        ("portfolio_vsm.forecast_milestone_completion", "Run Monte Carlo throughput simulation over historical engineering ticket velocity to forecast release dates", False, "analyst"),
+        ("portfolio_vsm.compare_planned_vs_actual_capacity", "Compare planned FTE investment by strategic theme against actual engineering ticket effort logged", False, "analyst"),
+        ("portfolio_vsm.generate_executive_steering_brief", "Synthesize weekly portfolio risk, at-risk OKRs, and recommended management actions for product leadership", False, "analyst"),
+        ("portfolio_vsm.reallocate_portfolio_capacity", "Reallocate engineering squad capacity across product portfolios to mitigate critical OKR slippage (mutating, requires HITL)", True, "platform_admin"),
+        ("portfolio_vsm.escalate_blocked_work_ticket", "Trigger cross-team blocker escalation and priority promotion on stalled engineering work tickets (mutating)", True, "data_engineer"),
+        ("portfolio_vsm.update_okr_confidence_status", "Update quarterly OKR confidence rating and attach mitigation action plan in portfolio ledger (mutating)", True, "analyst"),
+        ("portfolio_vsm.rebalance_sprint_backlog_scope", "Defer non-critical backlog tickets to next sprint to protect committed portfolio milestone SLA (mutating)", True, "data_engineer"),
+        ("portfolio_vsm.approve_milestone_scope_change", "Approve formal product portfolio baseline budget or milestone target date adjustment (mutating, requires HITL)", True, "platform_admin"),
+    ],
 }
+
+
+def _build_tool_input_schema(name: str, domain: str) -> Dict[str, Any]:
+    """Builds realistic, domain-specific JSON Schema Draft-07 contracts per MCP tool."""
+    env_prop = {
+        "type": "string",
+        "enum": ["prod", "staging", "dev"],
+        "default": "prod",
+    }
+    if name == "postgres.execute_outbound_wire":
+        return {
+            "type": "object",
+            "properties": {
+                "from_account": {"type": "string", "minLength": 3, "description": "Source institutional account ID"},
+                "to_account": {"type": "string", "minLength": 3, "description": "Destination institutional account ID"},
+                "amount_usd": {"type": "number", "minimum": 0.01, "description": "Wire amount in USD"},
+                "environment": env_prop,
+            },
+            "required": ["from_account", "to_account", "amount_usd"],
+        }
+    if name in ("snowflake.execute_readonly_sql", "snowflake.analyze_query_plan"):
+        return {
+            "type": "object",
+            "properties": {
+                "sql": {"type": "string", "minLength": 6, "description": "Read-only SELECT SQL query"},
+                "role": {"type": "string", "default": "ai_platform_reader"},
+                "schema_name": {"type": "string", "default": "PORTFOLIO_GOLD"},
+                "environment": env_prop,
+            },
+            "required": ["sql"],
+        }
+    if domain == "portfolio_vsm":
+        if name == "portfolio_vsm.reallocate_portfolio_capacity":
+            return {
+                "type": "object",
+                "properties": {
+                    "portfolio_id": {"type": "string", "minLength": 3, "description": "Target portfolio ID (e.g. PF-101)"},
+                    "delta_fte": {"type": "number", "minimum": -20.0, "maximum": 20.0},
+                    "justification": {"type": "string", "minLength": 5},
+                    "environment": env_prop,
+                },
+                "required": ["portfolio_id", "delta_fte"],
+            }
+        if name == "portfolio_vsm.escalate_blocked_work_ticket":
+            return {
+                "type": "object",
+                "properties": {
+                    "ticket_id": {"type": "string", "minLength": 3, "description": "Engineering ticket ID (e.g. ENG-401)"},
+                    "escalation_tier": {"type": "string", "enum": ["L2", "VP_ENG", "EXEC"], "default": "VP_ENG"},
+                    "environment": env_prop,
+                },
+                "required": ["ticket_id"],
+            }
+        return {
+            "type": "object",
+            "properties": {
+                "portfolio_id": {"type": "string", "description": "Optional portfolio ID filter (e.g. PF-101)"},
+                "okr_id": {"type": "string", "description": "Optional OKR ID filter (e.g. OKR-201)"},
+                "query": {"type": "string", "description": f"Natural language question for {name}"},
+                "limit": {"type": "integer", "minimum": 1, "maximum": 200, "default": 10},
+                "environment": env_prop,
+            },
+            "required": [],
+        }
+
+    return {
+        "type": "object",
+        "properties": {
+            "query_or_id": {
+                "type": "string",
+                "minLength": 1,
+                "description": f"Primary query, identifier, or payload for {name}",
+            },
+            "limit": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 500,
+                "default": 10,
+                "description": "Maximum records or chunks to return",
+            },
+            "environment": env_prop,
+        },
+        "required": ["query_or_id"],
+    }
 
 
 def get_enterprise_tool_catalog() -> List[Dict[str, Any]]:
     """
-    Returns the complete 105-tool Enterprise MCP Catalog with embeddings,
+    Returns the complete 120-tool Enterprise MCP Catalog with 64-dim embeddings,
     JSON Schema input contracts, RBAC roles, and token footprint estimates.
     """
     catalog: List[Dict[str, Any]] = []
@@ -235,26 +438,7 @@ def get_enterprise_tool_catalog() -> List[Dict[str, Any]]:
         templates = _DOMAIN_TOOL_TEMPLATES[domain]
         for name, desc, is_mutating, role in templates:
             emb = compute_query_embedding(f"{name} {domain} {desc}")
-            input_schema = {
-                "type": "object",
-                "properties": {
-                    "query_or_id": {
-                        "type": "string",
-                        "description": f"Primary query, identifier, or payload for {name}",
-                    },
-                    "limit": {
-                        "type": "integer",
-                        "default": 10,
-                        "description": "Maximum records or chunks to return",
-                    },
-                    "environment": {
-                        "type": "string",
-                        "enum": ["prod", "staging", "dev"],
-                        "default": "prod",
-                    },
-                },
-                "required": ["query_or_id"],
-            }
+            input_schema = _build_tool_input_schema(name, domain)
             # Realistic token count for full MCP tool definition (name + description + JSON schema properties)
             schema_tokens = 128 + len(desc.split()) * 2
             catalog.append(

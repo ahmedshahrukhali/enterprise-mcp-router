@@ -197,6 +197,8 @@ def test_sqlite_persistence_across_reloads():
     with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as tf:
         db_path = tf.name
 
+    store1 = None
+    store2 = None
     try:
         # Create store 1 and write ticket & snapshot
         store1 = SQLiteStateStore(db_path)
@@ -207,6 +209,8 @@ def test_sqlite_persistence_across_reloads():
             user_roles=["platform_admin"],
         )
         router1.resolve_hitl_interrupt(t["ticket_id"], reviewer="lead_reviewer", decision="APPROVED")
+        store1.close()
+        store1 = None
 
         # Now instantiate a completely new store & router from the same SQLite DB file
         store2 = SQLiteStateStore(db_path)
@@ -216,5 +220,14 @@ def test_sqlite_persistence_across_reloads():
         assert loaded_ticket["status"] == "APPROVED"
         assert loaded_ticket["reviewer"] == "lead_reviewer"
     finally:
-        if os.path.exists(db_path):
-            os.remove(db_path)
+        if store1 is not None:
+            store1.close()
+        if store2 is not None:
+            store2.close()
+        for suffix in ("", "-wal", "-shm"):
+            candidate = f"{db_path}{suffix}"
+            if os.path.exists(candidate):
+                try:
+                    os.remove(candidate)
+                except PermissionError:
+                    pass
