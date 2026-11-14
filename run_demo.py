@@ -24,14 +24,18 @@ from src.router import (
 
 def main() -> None:
     print("=" * 94)
-    print(" ENTERPRISE-MCP-ROUTER v2.2.0 | Hybrid BM25+Dense MCP Gateway & VSM Governance Benchmark")
+    print(" ENTERPRISE-MCP-ROUTER v2.3.0 | Zero-Trust MCP Gateway, AST SQL Guard & Honest Benchmark")
     print("=" * 94)
 
     # 1. Hybrid Semantic + Okapi BM25 Routing across 120 Enterprise Tools
     router = EnterpriseMCPRouter.from_enterprise_catalog()
     vsm = ValueStreamManagementConnector()
-    server = FastMCPServer(version="2.2.0", router=router, connectors={"vsm": vsm})
-    print(f"\n[1] Loaded Enterprise MCP Registry: {len(router.tools)} tools across 8 domains")
+    server = FastMCPServer(version="2.3.0", router=router, connectors={"vsm": vsm})
+    total_tokens = sum(t.schema_tokens for t in router.tools.values())
+    print(
+        f"\n[1] Loaded Enterprise MCP Registry: {len(router.tools)} tools across 8 domains "
+        f"({total_tokens:,} measured serialized schema tokens)"
+    )
 
     sample_queries = [
         "Query Snowflake Cortex Search for RRSP compliance guidelines and check fund NAV",
@@ -61,23 +65,29 @@ def main() -> None:
     blocked = router.authorize_execution("postgres.execute_outbound_wire", ["platform_admin"], hitl_approved=False)
     print(f"    - Unapproved Mutating Call   : allowed={blocked['allowed']} (reason={blocked['reason']})")
 
+    wire_args = {"from_account": "ACC-9001", "to_account": "ACC-9003", "amount_usd": 50000.0}
     ticket = router.create_hitl_interrupt(
         tool_name="postgres.execute_outbound_wire",
         requested_by="langgraph_treasury_agent",
         user_roles=["platform_admin"],
-        arguments={"from_account": "ACC-9001", "to_account": "ACC-9003", "amount_usd": 50000.0},
+        arguments=wire_args,
     )
     resolved = router.resolve_hitl_interrupt(
         ticket_id=ticket["ticket_id"],
         reviewer="sr_ops_approver@enterprise.io",
         decision="APPROVED",
+        reviewer_roles=["super_admin"],
     )
     auth_after = router.authorize_execution(
         "postgres.execute_outbound_wire",
         ["platform_admin"],
         hitl_ticket_id=resolved["ticket_id"],
+        arguments=wire_args,
     )
-    print(f"    - Post-HITL Approval Call    : allowed={auth_after['allowed']} (ticket={resolved['ticket_id']})")
+    print(
+        f"    - Post-HITL Approval Call    : allowed={auth_after['allowed']} "
+        f"(ticket={resolved['ticket_id']}, arg_hash={resolved['arguments_hash'][:12]}...)"
+    )
 
     # 3. Snowflake Cortex Search, Informatica IICS & Real SQLite3 Relational Snapshots
     print("\n[3] Cloud & Relational Data Connectors (Snowflake, Informatica IICS, SQLite3/Postgres):")

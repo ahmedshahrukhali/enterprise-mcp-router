@@ -8,6 +8,7 @@ Verifies:
 """
 
 import os
+import sqlite3
 import tempfile
 import time
 from fastapi.testclient import TestClient
@@ -15,7 +16,11 @@ from fastapi.testclient import TestClient
 from src.connectors.sql_guard import SafeSQLValidator
 from src.main import app
 from src.router import EnterpriseMCPRouter
-from src.security import AuthenticatedPrincipal, HITLGovernanceRules
+from src.security import (
+    DEFAULT_RATE_LIMITER,
+    create_jwt_token,
+    verify_jwt_token,
+)
 from src.storage import SQLiteStateStore
 
 client = TestClient(app)
@@ -177,20 +182,33 @@ def test_hitl_ticket_expiration_and_replay_prevention():
 
 
 def test_api_cannot_bypass_hitl_without_ticket():
-    # Calling /api/v1/governance/authorize for a mutating tool with hitl_approved=True
-    # but NO ticket must be rejected
-    resp = client.post(
+    # 1. Unauthenticated caller supplying client user_roles + hitl_approved is downgraded to anonymous_readonly -> rbac_denied
+    anon_resp = client.post(
         "/api/v1/governance/authorize",
         json={
             "tool_name": "postgres.execute_outbound_wire",
             "user_roles": ["platform_admin"],
-            "hitl_approved": True,  # Attacker attempt to bypass approval
+            "hitl_approved": True,
             "hitl_ticket_id": None,
         },
     )
-    data = resp.json()
-    assert data["allowed"] is False
-    assert data["reason"] in ("hitl_ticket_required", "hitl_approval_required")
+    anon_data = anon_resp.json()
+    assert anon_data["allowed"] is False
+    assert anon_data["reason"] == "rbac_denied"
+
+    # 2. Authenticated platform_admin attempting hitl_approved=True without server ticket -> hitl_ticket_required
+    admin_resp = client.post(
+        "/api/v1/governance/authorize",
+        headers={"X-API-Key": "ak-admin-demo"},
+        json={
+            "tool_name": "postgres.execute_outbound_wire",
+            "hitl_approved": True,
+            "hitl_ticket_id": None,
+        },
+    )
+    admin_data = admin_resp.json()
+    assert admin_data["allowed"] is False
+    assert admin_data["reason"] == "hitl_ticket_required"
 
 
 def test_sqlite_persistence_across_reloads():
@@ -209,6 +227,7 @@ def test_sqlite_persistence_across_reloads():
             user_roles=["platform_admin"],
         )
         router1.resolve_hitl_interrupt(t["ticket_id"], reviewer="lead_reviewer", decision="APPROVED")
+        assert store1.verify_audit_chain()["valid"] is True
         store1.close()
         store1 = None
 
@@ -219,6 +238,20 @@ def test_sqlite_persistence_across_reloads():
         assert loaded_ticket is not None
         assert loaded_ticket["status"] == "APPROVED"
         assert loaded_ticket["reviewer"] == "lead_reviewer"
+        assert store2.verify_audit_chain()["valid"] is True
+
+        # Verify SQLite append-only triggers reject UPDATE and DELETE on audit_events
+        try:
+            store2._conn.execute("UPDATE audit_events SET data_json = '{}' WHERE id = 1")
+            raise AssertionError("Expected sqlite3.DatabaseError on audit UPDATE")
+        except sqlite3.DatabaseError as exc:
+            assert "append_only" in str(exc).lower()
+
+        try:
+            store2._conn.execute("DELETE FROM audit_events WHERE id = 1")
+            raise AssertionError("Expected sqlite3.DatabaseError on audit DELETE")
+        except sqlite3.DatabaseError as exc:
+            assert "append_only" in str(exc).lower()
     finally:
         if store1 is not None:
             store1.close()
@@ -231,3 +264,216 @@ def test_sqlite_persistence_across_reloads():
                     os.remove(candidate)
                 except PermissionError:
                     pass
+
+
+def test_phase0_bypass_regression_suite(monkeypatch):
+    # 1. Mint HS256 JWT tokens for requester and peer reviewer
+    requester_jwt = create_jwt_token("wire_agent_01", ["platform_admin"], expires_in_seconds=600)
+    reviewer_jwt = create_jwt_token("sr_ops_approver", ["super_admin"], expires_in_seconds=600)
+    expired_jwt = create_jwt_token("wire_agent_01", ["platform_admin"], expires_in_seconds=-10)
+
+    claims = verify_jwt_token(requester_jwt)
+    assert claims["sub"] == "wire_agent_01"
+
+    try:
+        verify_jwt_token(expired_jwt)
+        raise AssertionError("Expired JWT must be rejected")
+    except ValueError as exc:
+        assert "expired" in str(exc)
+
+    tampered_jwt = requester_jwt[:-4] + "ZZZZ"
+    try:
+        verify_jwt_token(tampered_jwt)
+        raise AssertionError("Tampered JWT signature must be rejected")
+    except ValueError:
+        pass
+
+    # Unauthenticated tools/call claiming hitl_approved=True + user_roles=["platform_admin"] is blocked (-32001)
+    unauth_rpc = client.post(
+        "/mcp/jsonrpc",
+        json={
+            "jsonrpc": "2.0",
+            "id": 501,
+            "method": "tools/call",
+            "params": {
+                "name": "postgres.execute_outbound_wire",
+                "user_roles": ["platform_admin"],
+                "hitl_approved": True,
+                "arguments": {"from_account": "ACC-9001", "to_account": "ACC-9003", "amount_usd": 100.0},
+            },
+        },
+    ).json()
+    assert unauth_rpc["error"]["code"] == -32001
+    assert unauth_rpc["error"]["data"]["reason"] == "rbac_denied"
+
+    # Authenticated platform_admin tools/call claiming hitl_approved=True WITHOUT a ticket is blocked (-32002)
+    noticket_rpc = client.post(
+        "/mcp/jsonrpc",
+        headers={"Authorization": f"Bearer {requester_jwt}"},
+        json={
+            "jsonrpc": "2.0",
+            "id": 502,
+            "method": "tools/call",
+            "params": {
+                "name": "postgres.execute_outbound_wire",
+                "hitl_approved": True,
+                "arguments": {"from_account": "ACC-9001", "to_account": "ACC-9003", "amount_usd": 100.0},
+            },
+        },
+    ).json()
+    assert noticket_rpc["error"]["code"] == -32002
+    assert noticket_rpc["error"]["data"]["reason"] == "hitl_ticket_required"
+
+    # Create canonical-argument bound ticket as wire_agent_01
+    approved_args = {"from_account": "ACC-9001", "to_account": "ACC-9003", "amount_usd": 100.0}
+    create_resp = client.post(
+        "/api/v1/governance/hitl/create",
+        headers={"Authorization": f"Bearer {requester_jwt}"},
+        json={"tool_name": "postgres.execute_outbound_wire", "arguments": approved_args},
+    )
+    assert create_resp.status_code == 200
+    ticket_id = create_resp.json()["ticket_id"]
+
+    # Self-approval attempt via HTTP must be rejected with 403
+    self_approve = client.post(
+        "/api/v1/governance/hitl/resolve",
+        headers={"Authorization": f"Bearer {requester_jwt}"},
+        json={"ticket_id": ticket_id, "decision": "APPROVED"},
+    )
+    assert self_approve.status_code == 403
+
+    # Peer super_admin approves ticket
+    peer_approve = client.post(
+        "/api/v1/governance/hitl/resolve",
+        headers={"Authorization": f"Bearer {reviewer_jwt}"},
+        json={"ticket_id": ticket_id, "decision": "APPROVED"},
+    )
+    assert peer_approve.status_code == 200
+
+    # Argument-tampered execution (amount_usd=999999.0 instead of 100.0) MUST be blocked by SHA-256 hash mismatch!
+    tampered_args = {"from_account": "ACC-9001", "to_account": "ACC-9003", "amount_usd": 999999.0}
+    tampered_call = client.post(
+        "/mcp/jsonrpc",
+        headers={"Authorization": f"Bearer {requester_jwt}"},
+        json={
+            "jsonrpc": "2.0",
+            "id": 503,
+            "method": "tools/call",
+            "params": {
+                "name": "postgres.execute_outbound_wire",
+                "hitl_ticket_id": ticket_id,
+                "arguments": tampered_args,
+            },
+        },
+    ).json()
+    assert tampered_call["error"]["code"] == -32002
+    assert tampered_call["error"]["data"]["reason"] == "hitl_ticket_arguments_hash_mismatch"
+
+    # Untampered execution with exact approved arguments succeeds once, and replay is blocked
+    valid_call = client.post(
+        "/mcp/jsonrpc",
+        headers={"Authorization": f"Bearer {requester_jwt}"},
+        json={
+            "jsonrpc": "2.0",
+            "id": 504,
+            "method": "tools/call",
+            "params": {
+                "name": "postgres.execute_outbound_wire",
+                "hitl_ticket_id": ticket_id,
+                "arguments": approved_args,
+            },
+        },
+    ).json()
+    assert valid_call["result"]["isError"] is False
+
+    replay_call = client.post(
+        "/mcp/jsonrpc",
+        headers={"Authorization": f"Bearer {requester_jwt}"},
+        json={
+            "jsonrpc": "2.0",
+            "id": 505,
+            "method": "tools/call",
+            "params": {
+                "name": "postgres.execute_outbound_wire",
+                "hitl_ticket_id": ticket_id,
+                "arguments": approved_args,
+            },
+        },
+    ).json()
+    assert replay_call["error"]["code"] == -32002
+    assert replay_call["error"]["data"]["reason"] == "hitl_ticket_already_consumed"
+
+    # Rate limiter HTTP 429 enforcement check (reset afterward so other tests stay clean)
+    try:
+        DEFAULT_RATE_LIMITER.reset()
+        monkeypatch.setenv("ROUTER_RATE_LIMIT_RPM", "2")
+        rl_hdr = {"Authorization": f"Bearer {create_jwt_token('rate_probe', ['analyst'], 60)}"}
+        assert client.post("/api/v1/router/search", headers=rl_hdr, json={"query": "NAV"}).status_code == 200
+        assert client.post("/api/v1/router/search", headers=rl_hdr, json={"query": "NAV"}).status_code == 200
+        blocked_429 = client.post("/api/v1/router/search", headers=rl_hdr, json={"query": "NAV"})
+        assert blocked_429.status_code == 429
+    finally:
+        DEFAULT_RATE_LIMITER.reset()
+
+
+def test_sql_guard_adversarial_payload_suite():
+    """Tests 34 real SQL payloads (26 attacks + 8 safe read-only / quoted-keyword queries)."""
+    adversarial_attacks = [
+        ("SYSTEM$WHITELIST()", "SELECT SYSTEM$WHITELIST() FROM PORTFOLIO_GOLD.FUNDS"),
+        ("SYSTEM$CANCEL_ALL_QUERIES()", "SELECT SYSTEM$CANCEL_ALL_QUERIES()"),
+        ("SYSTEM$TYPEOF()", "SELECT SYSTEM$TYPEOF(1) FROM PORTFOLIO_GOLD.FUNDS"),
+        ("pg_sleep(10)", "SELECT pg_sleep(10) FROM PORTFOLIO_GOLD.FUNDS"),
+        ("pg_read_file()", "SELECT pg_read_file('/etc/passwd') FROM PORTFOLIO_GOLD.FUNDS"),
+        ("lo_import()", "SELECT lo_import('/etc/passwd') FROM PORTFOLIO_GOLD.FUNDS"),
+        ("pg_terminate_backend()", "SELECT pg_terminate_backend(1) FROM PORTFOLIO_GOLD.FUNDS"),
+        ("FOR UPDATE lock", "SELECT * FROM PORTFOLIO_GOLD.FUNDS FOR UPDATE"),
+        ("FOR SHARE lock", "SELECT * FROM PORTFOLIO_GOLD.FUNDS FOR SHARE"),
+        ("SELECT INTO table", "SELECT * INTO evil_copy FROM PORTFOLIO_GOLD.FUNDS"),
+        ("CREATE TABLE", "CREATE TABLE evil_tbl (id INT)"),
+        ("DROP TABLE", "DROP TABLE PORTFOLIO_GOLD.FUNDS"),
+        ("DELETE FROM", "DELETE FROM PORTFOLIO_GOLD.FUNDS WHERE 1=1"),
+        ("UPDATE SET", "UPDATE PORTFOLIO_GOLD.FUNDS SET nav = 0"),
+        ("INSERT INTO", "INSERT INTO PORTFOLIO_GOLD.FUNDS VALUES ('X', 1, 1)"),
+        ("TRUNCATE TABLE", "TRUNCATE TABLE PORTFOLIO_GOLD.FUNDS"),
+        ("ALTER TABLE", "ALTER TABLE PORTFOLIO_GOLD.FUNDS ADD COLUMN x INT"),
+        ("GRANT ALL", "GRANT ALL ON PORTFOLIO_GOLD.FUNDS TO PUBLIC"),
+        ("REVOKE SELECT", "REVOKE SELECT ON PORTFOLIO_GOLD.FUNDS FROM analyst"),
+        ("MERGE INTO", "MERGE INTO PORTFOLIO_GOLD.FUNDS USING src ON 1=1 WHEN MATCHED THEN DELETE"),
+        ("COPY TO file", "COPY PORTFOLIO_GOLD.FUNDS TO '/tmp/out.csv'"),
+        ("CTE DELETE", "WITH d AS (DELETE FROM PORTFOLIO_GOLD.FUNDS RETURNING *) SELECT * FROM d"),
+        ("Stacked DELETE", "SELECT 1; DELETE FROM PORTFOLIO_GOLD.FUNDS"),
+        ("Comment-obfuscated INSERT", "/* benign */ INSERT INTO PORTFOLIO_GOLD.FUNDS VALUES (1)"),
+        ("Stacked DROP", "SELECT fund_id FROM PORTFOLIO_GOLD.FUNDS; DROP TABLE PORTFOLIO_GOLD.FUNDS"),
+        ("CALL procedure", "CALL system_admin_proc('arg')"),
+    ]
+    for label, sql in adversarial_attacks:
+        res = SafeSQLValidator.validate_readonly_sql(
+            sql=sql,
+            dialect="snowflake",
+            allowed_roles={"platform_admin"},
+            allowed_schemas={"PORTFOLIO_GOLD"},
+            role="platform_admin",
+            schema="PORTFOLIO_GOLD",
+        )
+        assert res["valid"] is False, f"Attack payload was NOT blocked ({label}): {res}"
+
+    safe_queries = [
+        ("Quoted keyword identifiers", 'SELECT "update", "delete", "select", fund_id FROM PORTFOLIO_GOLD.FUNDS LIMIT 10'),
+        ("Allow-listed aggregates", "SELECT COUNT(*), SUM(nav), AVG(aum_cad), MIN(nav), MAX(nav) FROM PORTFOLIO_GOLD.FUNDS"),
+        ("Allow-listed scalar fns", "SELECT COALESCE(fund_id, 'NONE'), ROUND(nav, 2), CAST(active AS VARCHAR) FROM PORTFOLIO_GOLD.FUNDS"),
+        ("String transforms", "SELECT fund_id, UPPER(TRIM(name)), LOWER(category) FROM PORTFOLIO_GOLD.FUNDS ORDER BY nav DESC LIMIT 5"),
+        ("SUBSTR & ABS", "SELECT fund_id, SUBSTR(name, 1, 8), ABS(nav) FROM PORTFOLIO_GOLD.FUNDS WHERE fund_id IN ('POL-101', 'POL-102')"),
+        ("Read-only CTE", "WITH top_funds AS (SELECT fund_id, nav FROM PORTFOLIO_GOLD.FUNDS WHERE nav > 10) SELECT * FROM top_funds"),
+        ("CASE expression", "SELECT CASE WHEN nav > 50 THEN 'HIGH' ELSE 'LOW' END AS tier FROM PORTFOLIO_GOLD.FUNDS"),
+        ("String literal semicolons", "SELECT DISTINCT fund_id FROM PORTFOLIO_GOLD.FUNDS WHERE note = 'DROP TABLE test; update=true'"),
+    ]
+    for label, sql in safe_queries:
+        res = SafeSQLValidator.validate_readonly_sql(
+            sql=sql,
+            dialect="snowflake",
+            allowed_roles={"platform_admin"},
+            allowed_schemas={"PORTFOLIO_GOLD"},
+            role="platform_admin",
+            schema="PORTFOLIO_GOLD",
+        )
+        assert res["valid"] is True, f"Safe SQL was falsely blocked ({label}): {res}"

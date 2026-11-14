@@ -27,6 +27,15 @@ class SemanticRouteRequest(BaseModel):
     )
     top_k: int = Field(default=5, ge=1, le=25, description="Number of top semantic tools to route")
     domain_filter: Optional[str] = Field(default=None, description="Optional enterprise namespace filter")
+    scoring_mode: str = Field(
+        default="hybrid",
+        pattern="^(hybrid|dense_only|bm25_only)$",
+        description="Scorer blend mode for routing evaluation",
+    )
+    auto_widen: bool = Field(
+        default=False,
+        description="Automatically widen k fallback when top-k hybrid score confidence is low",
+    )
 
 
 class RoutedToolItem(BaseModel):
@@ -45,7 +54,12 @@ class RoutedToolItem(BaseModel):
 class SemanticRouteResponse(BaseModel):
     query: str
     top_k: int
+    effective_k: Optional[int] = None
+    widened_k: bool = False
+    scoring_mode: str = "hybrid"
+    caller_roles_applied: List[str] = Field(default_factory=list)
     total_registered_tools: int
+    total_accessible_tools: Optional[int] = None
     full_registry_tokens: int
     routed_tokens: int
     token_reduction_pct: float
@@ -55,16 +69,14 @@ class SemanticRouteResponse(BaseModel):
 
 class AuthorizationRequest(BaseModel):
     tool_name: str = Field(..., description="Target MCP tool name")
-    user_roles: List[str] = Field(default_factory=lambda: ["analyst"], description="OAuth2 / RBAC roles")
-    hitl_approved: bool = Field(default=False, description="Whether HITL approval token is present")
-    hitl_ticket_id: Optional[str] = Field(default=None, description="Optional approved HITL ticket ID")
+    hitl_ticket_id: Optional[str] = Field(
+        default=None, description="Server-issued approved HITL ticket ID bound to canonical arguments"
+    )
     arguments: Dict[str, Any] = Field(default_factory=dict, description="Tool invocation arguments")
 
 
 class HITLCreateRequest(BaseModel):
     tool_name: str = Field(..., description="Mutating tool requiring human approval")
-    requested_by: str = Field(default="agent_workflow_prod_01", description="Agent or user principal")
-    user_roles: List[str] = Field(default_factory=lambda: ["platform_admin"])
     arguments: Dict[str, Any] = Field(default_factory=dict)
     justification: str = Field(default="Automated S&OP / treasury rebalance execution")
     ttl_seconds: int = Field(default=1800, ge=-3600, le=86400, description="Ticket expiration TTL in seconds")
@@ -72,9 +84,23 @@ class HITLCreateRequest(BaseModel):
 
 class HITLResolutionRequest(BaseModel):
     ticket_id: str = Field(..., description="HITL interrupt ticket ID")
-    reviewer: str = Field(default="sr_ops_approver@enterprise.io", description="Human reviewer identity")
     decision: str = Field(..., pattern="^(APPROVED|REJECTED)$", description="APPROVED or REJECTED")
     notes: str = Field(default="Verified parameters against change-control ticket.")
+
+
+class AuthTokenRequest(BaseModel):
+    username: str = Field(default="demo_operator@enterprise.io", min_length=2, max_length=120)
+    role: str = Field(
+        default="analyst",
+        pattern="^(ai_platform_reader|analyst|data_engineer|compliance_officer|platform_admin|super_admin)$",
+        description="Verified session persona role for HS256 JWT minting",
+    )
+
+
+class RoutingFeedbackRequest(BaseModel):
+    query: str = Field(..., min_length=1)
+    routed_tools: List[str] = Field(default_factory=list)
+    selected_tool: str = Field(..., min_length=1)
 
 
 class SnowflakeSQLValidationRequest(BaseModel):

@@ -12,15 +12,22 @@ Exposes:
 """
 
 import json
+import os
 import time
 from typing import Any, Dict, Iterator, Optional
 from fastapi import Depends, FastAPI, HTTPException
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 
 from src.dashboard_html import DASHBOARD_HTML
-from src.security import AuthenticatedPrincipal, get_current_principal
+from src.security import (
+    AuthenticatedPrincipal,
+    create_jwt_token,
+    enforce_rate_limit,
+    is_role_authorized,
+)
 from src.models import (
     AuthorizationRequest,
+    AuthTokenRequest,
     BedrockStructuredInvokeRequest,
     HITLCreateRequest,
     HITLResolutionRequest,
@@ -28,6 +35,7 @@ from src.models import (
     MCPJsonRpcRequest,
     PostgresQueryRequest,
     PostgresSnapshotRequest,
+    RoutingFeedbackRequest,
     RunbookLookupRequest,
     SchemaValidationRequest,
     SemanticRouteRequest,
@@ -136,15 +144,21 @@ def health_check() -> Dict[str, Any]:
 
 
 @app.post("/mcp/jsonrpc")
-def mcp_jsonrpc_endpoint(req: MCPJsonRpcRequest) -> Dict[str, Any]:
+def mcp_jsonrpc_endpoint(
+    req: MCPJsonRpcRequest,
+    principal: AuthenticatedPrincipal = Depends(enforce_rate_limit),
+) -> Dict[str, Any]:
     """Standard Model Context Protocol (MCP) JSON-RPC 2.0 endpoint."""
-    return fastmcp_server.handle_jsonrpc(req.model_dump())
+    return fastmcp_server.handle_jsonrpc(req.model_dump(), principal=principal)
 
 
 @app.post("/mcp/messages")
-def mcp_messages_endpoint(req: MCPJsonRpcRequest) -> Dict[str, Any]:
+def mcp_messages_endpoint(
+    req: MCPJsonRpcRequest,
+    principal: AuthenticatedPrincipal = Depends(enforce_rate_limit),
+) -> Dict[str, Any]:
     """MCP HTTP+SSE message dispatch endpoint."""
-    return fastmcp_server.handle_jsonrpc(req.model_dump())
+    return fastmcp_server.handle_jsonrpc(req.model_dump(), principal=principal)
 
 
 @app.get("/mcp/sse")
@@ -164,38 +178,92 @@ def mcp_sse_endpoint() -> StreamingResponse:
     return StreamingResponse(_event_stream(), media_type="text/event-stream")
 
 
+@app.post("/api/v1/auth/token")
+def issue_session_jwt(
+    req: AuthTokenRequest,
+    principal: AuthenticatedPrincipal = Depends(enforce_rate_limit),
+) -> Dict[str, Any]:
+    """
+    Mints a short-lived HS256 JWT bearer token for local/UI RBAC persona switching.
+    In production deployments backed by an external OIDC IdP, set MCP_DISABLE_DEMO_TOKEN_MINT=1.
+    """
+    if os.getenv("MCP_DISABLE_DEMO_TOKEN_MINT", "0") == "1":
+        raise HTTPException(status_code=403, detail="demo_token_minting_disabled")
+    token = create_jwt_token(username=req.username, roles=[req.role], expires_in_seconds=3600)
+    return {
+        "access_token": token,
+        "token_type": "Bearer",
+        "username": req.username,
+        "roles": [req.role],
+        "expires_in": 3600,
+    }
+
+
 @app.post("/api/v1/router/search")
-def semantic_route_tools(req: SemanticRouteRequest) -> Dict[str, Any]:
-    """Routes natural language intent to top-k MCP tools via BM25 + 64-dim dense RRF scoring."""
+def semantic_route_tools(
+    req: SemanticRouteRequest,
+    principal: AuthenticatedPrincipal = Depends(enforce_rate_limit),
+) -> Dict[str, Any]:
+    """Routes natural language intent to top-k role-authorized MCP tools via tuned BM25 + dense RRF scoring."""
     res = mcp_router.route_by_query(
         query=req.query,
         k=req.top_k,
         domain_filter=req.domain_filter,
+        caller_roles=principal.roles,
+        scoring_mode=req.scoring_mode,
+        auto_widen=req.auto_widen,
     )
     telemetry_monitor.record_span(
         span_name="mcp.router.semantic_search",
         use_case="mcp_tool_discovery",
         latency_ms=res["routing_latency_ms"],
         status="OK",
-        prompt_tokens=res["routed_tokens"] // 4,
+        prompt_tokens=max(1, res["routed_tokens"] // 4),
         completion_tokens=32,
     )
     return res
 
 
+@app.post("/api/v1/router/feedback")
+def record_routing_feedback(
+    req: RoutingFeedbackRequest,
+    principal: AuthenticatedPrincipal = Depends(enforce_rate_limit),
+) -> Dict[str, Any]:
+    """Records whether an LLM actually selected one of the routed top-k tools, queuing misses for eval."""
+    return mcp_router.record_tool_selection_feedback(
+        query=req.query,
+        routed_tools=req.routed_tools,
+        selected_tool=req.selected_tool,
+    )
+
+
+@app.get("/api/v1/router/misses")
+def get_routing_misses(
+    principal: AuthenticatedPrincipal = Depends(enforce_rate_limit),
+) -> Dict[str, Any]:
+    """Returns captured routing misses queued for the continuous evaluation dataset."""
+    return {
+        "stats": dict(mcp_router.routing_feedback_stats),
+        "misses": list(reversed(mcp_router.routing_misses_eval_queue)),
+    }
+
+
 @app.post("/api/v1/governance/authorize")
 def authorize_tool_call(
     req: AuthorizationRequest,
-    principal: AuthenticatedPrincipal = Depends(get_current_principal),
+    principal: AuthenticatedPrincipal = Depends(enforce_rate_limit),
 ) -> Dict[str, Any]:
-    """Evaluates deterministic RBAC and HITL approval gates for a tool invocation."""
-    user_roles = principal.roles if principal.is_authenticated else (req.user_roles or principal.roles)
+    """
+    Evaluates deterministic JWT/API-key RBAC and server-side HITL ticket + argument-hash approval gates.
+    Client-supplied user_roles and hitl_approved are not accepted.
+    """
     return mcp_router.authorize_execution(
         tool_name=req.tool_name,
-        user_roles=user_roles,
-        hitl_approved=False,  # External callers must supply an approved hitl_ticket_id for mutations
+        user_roles=principal.roles,
+        hitl_approved=False,
         hitl_ticket_id=req.hitl_ticket_id,
         require_ticket=True,
+        arguments=req.arguments,
     )
 
 
@@ -210,23 +278,47 @@ def validate_tool_schema(req: SchemaValidationRequest) -> Dict[str, Any]:
 
 @app.get("/api/v1/governance/hitl")
 def list_hitl_tickets() -> Dict[str, Any]:
-    """Lists all Human-in-the-Loop (HITL) approval interrupt tickets."""
-    tickets = list(mcp_router.hitl_tickets.values())
-    return {"total": len(tickets), "tickets": list(reversed(tickets))}
+    """Lists all Human-in-the-Loop (HITL) approval interrupt tickets from durable storage."""
+    tickets = mcp_router.storage.list_tickets()
+    return {"total": len(tickets), "tickets": tickets}
+
+
+@app.get("/api/v1/governance/audit-verify")
+def verify_audit_hash_chain() -> Dict[str, Any]:
+    """Verifies SHA-256 hash-chain tamper integrity across persisted append-only audit events."""
+    chain = mcp_router.storage.verify_audit_chain()
+    return {
+        **chain,
+        "checked_events": chain.get("total_events", 0),
+        "recent_events": mcp_router.storage.get_audit_trail(limit=15),
+    }
 
 
 @app.post("/api/v1/governance/hitl/create")
 def create_hitl_ticket(
     req: HITLCreateRequest,
-    principal: AuthenticatedPrincipal = Depends(get_current_principal),
-) -> Dict[str, Any]:
-    """Creates a new Human-in-the-Loop (HITL) approval interrupt ticket."""
-    requested_by = principal.username if principal.is_authenticated else req.requested_by
-    user_roles = principal.roles if principal.is_authenticated else req.user_roles
+    principal: AuthenticatedPrincipal = Depends(enforce_rate_limit),
+) -> Any:
+    """Creates a new Human-in-the-Loop (HITL) approval interrupt ticket bound to verified principal & arg hash."""
+    if not principal.is_authenticated:
+        raise HTTPException(status_code=401, detail="authentication_required_to_create_hitl_ticket")
+
+    spec = mcp_router.tools.get(req.tool_name)
+    if spec and not is_role_authorized(spec.required_role, principal.roles):
+        return JSONResponse(
+            status_code=403,
+            content={
+                "status": "error",
+                "reason": "rbac_denied",
+                "required_role": spec.required_role,
+                "caller_roles": principal.roles,
+            },
+        )
+
     return mcp_router.create_hitl_interrupt(
         tool_name=req.tool_name,
-        requested_by=requested_by,
-        user_roles=user_roles,
+        requested_by=principal.username,
+        user_roles=principal.roles,
         arguments=req.arguments,
         justification=req.justification,
         ttl_seconds=req.ttl_seconds,
@@ -236,18 +328,18 @@ def create_hitl_ticket(
 @app.post("/api/v1/governance/hitl/resolve")
 def resolve_hitl_ticket(
     req: HITLResolutionRequest,
-    principal: AuthenticatedPrincipal = Depends(get_current_principal),
+    principal: AuthenticatedPrincipal = Depends(enforce_rate_limit),
 ) -> Any:
-    """Approves or rejects a pending Human-in-the-Loop (HITL) interrupt ticket."""
-    reviewer = principal.username if principal.is_authenticated else req.reviewer
-    reviewer_roles = principal.roles if principal.is_authenticated else ["platform_admin"]
+    """Approves or rejects a pending Human-in-the-Loop (HITL) interrupt ticket via verified reviewer identity."""
+    if not principal.is_authenticated:
+        raise HTTPException(status_code=401, detail="authentication_required_to_resolve_hitl_ticket")
 
     result = mcp_router.resolve_hitl_interrupt(
         ticket_id=req.ticket_id,
-        reviewer=reviewer,
+        reviewer=principal.username,
         decision=req.decision,
         notes=req.notes,
-        reviewer_roles=reviewer_roles,
+        reviewer_roles=principal.roles,
     )
     if result.get("status") == "error":
         reason = result.get("reason", "")
@@ -337,13 +429,24 @@ def create_postgres_snapshot(req: PostgresSnapshotRequest) -> Dict[str, Any]:
 @app.post("/api/v1/connectors/postgres/snapshot/restore")
 def restore_postgres_snapshot(
     req: PostgresSnapshotRequest,
-    principal: AuthenticatedPrincipal = Depends(get_current_principal),
+    principal: AuthenticatedPrincipal = Depends(enforce_rate_limit),
 ) -> Dict[str, Any]:
     """Restores the relational ledger to a verified point-in-time snapshot."""
-    if not (principal.has_role("platform_admin") or "platform_admin" in principal.roles):
+    if not principal.is_authenticated or not is_role_authorized("platform_admin", principal.roles):
         raise HTTPException(status_code=403, detail="platform_admin_role_required_for_snapshot_restore")
-    actor = principal.username if principal.is_authenticated else "platform_admin"
-    return postgres_connector.restore_snapshot(req.snapshot_name, actor=actor)
+    return postgres_connector.restore_snapshot(req.snapshot_name, actor=principal.username)
+
+
+@app.get("/api/v1/router/benchmark")
+def get_router_benchmark() -> Dict[str, Any]:
+    """Returns cached honest 160-query Recall@k and ablation measurements over serialized schemas."""
+    cached = getattr(app.state, "benchmark_cache", None)
+    if cached is None:
+        from src.registry.eval_dataset import run_full_routing_benchmark
+
+        cached = run_full_routing_benchmark(mcp_router)
+        app.state.benchmark_cache = cached
+    return cached
 
 
 @app.post("/api/v1/adapters/bedrock/invoke")

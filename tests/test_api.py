@@ -47,14 +47,19 @@ def test_mcp_sse_transport_endpoint():
 
 
 def test_semantic_router_and_governance_endpoints():
+    admin_headers = {"X-API-Key": "ak-admin-demo"}
+    reviewer_headers = {"X-API-Key": "ak-superadmin-demo"}
+
     route_resp = client.post(
         "/api/v1/router/search",
+        headers=admin_headers,
         json={"query": "Execute outbound wire in PostgreSQL ledger", "top_k": 5},
     )
     assert route_resp.status_code == 200
     r_data = route_resp.json()
     assert r_data["total_registered_tools"] == 120
     assert r_data["token_reduction_pct"] > 90.0
+    assert r_data["full_registry_tokens"] > 25000
     assert "bm25_score" in r_data["routed_tools"][0]
 
     # Validate JSON Schema contract check endpoint
@@ -65,24 +70,28 @@ def test_semantic_router_and_governance_endpoints():
     assert bad_schema_resp.status_code == 200
     assert bad_schema_resp.json()["valid"] is False
 
-    # Create and resolve HITL interrupt ticket via API
+    wire_args = {"from_account": "ACC-9001", "to_account": "ACC-9003", "amount_usd": 10000}
+
+    # Create and resolve HITL interrupt ticket via authenticated principals
     create_resp = client.post(
         "/api/v1/governance/hitl/create",
+        headers=admin_headers,
         json={
             "tool_name": "postgres.execute_outbound_wire",
-            "requested_by": "test_suite_agent",
-            "user_roles": ["platform_admin"],
-            "arguments": {"from_account": "ACC-9001", "to_account": "ACC-9003", "amount_usd": 10000},
+            "arguments": wire_args,
+            "justification": "API integration test wire transfer",
         },
     )
     assert create_resp.status_code == 200
-    ticket_id = create_resp.json()["ticket_id"]
+    ticket_payload = create_resp.json()
+    ticket_id = ticket_payload["ticket_id"]
+    assert "arguments_hash" in ticket_payload
 
     resolve_resp = client.post(
         "/api/v1/governance/hitl/resolve",
+        headers=reviewer_headers,
         json={
             "ticket_id": ticket_id,
-            "reviewer": "ops_lead@enterprise.io",
             "decision": "APPROVED",
         },
     )
@@ -91,10 +100,11 @@ def test_semantic_router_and_governance_endpoints():
 
     auth_resp = client.post(
         "/api/v1/governance/authorize",
+        headers=admin_headers,
         json={
             "tool_name": "postgres.execute_outbound_wire",
-            "user_roles": ["platform_admin"],
             "hitl_ticket_id": ticket_id,
+            "arguments": wire_args,
         },
     )
     assert auth_resp.status_code == 200
@@ -242,4 +252,82 @@ def test_rbac_denial_and_jsonrpc_32001():
     err = resp.json()["error"]
     assert err["code"] == -32001
     assert err["data"]["reason"] == "rbac_denied"
+
+
+def test_jwt_session_role_filtering_and_mcp_pagination():
+    # Issue real HS256 JWT tokens for analyst and platform_admin
+    tok_analyst = client.post(
+        "/api/v1/auth/token",
+        json={"username": "junior_analyst@enterprise.io", "role": "analyst"},
+    )
+    assert tok_analyst.status_code == 200
+    analyst_jwt = tok_analyst.json()["access_token"]
+
+    tok_admin = client.post(
+        "/api/v1/auth/token",
+        json={"username": "ops_admin@enterprise.io", "role": "platform_admin"},
+    )
+    assert tok_admin.status_code == 200
+    admin_jwt = tok_admin.json()["access_token"]
+
+    # Analyst searches for wire/admin action -> must NEVER see platform_admin tools
+    analyst_search = client.post(
+        "/api/v1/router/search",
+        headers={"Authorization": f"Bearer {analyst_jwt}"},
+        json={"query": "Execute outbound wire in PostgreSQL ledger", "top_k": 10},
+    )
+    assert analyst_search.status_code == 200
+    a_data = analyst_search.json()
+    assert all(t["required_role"] in ("analyst", "ai_platform_reader") for t in a_data["routed_tools"])
+    assert "postgres.execute_outbound_wire" not in [t["name"] for t in a_data["routed_tools"]]
+
+    # Admin JWT sees full accessible set including execute_outbound_wire
+    admin_search = client.post(
+        "/api/v1/router/search",
+        headers={"Authorization": f"Bearer {admin_jwt}"},
+        json={"query": "Execute outbound wire in PostgreSQL ledger", "top_k": 5},
+    )
+    assert admin_search.status_code == 200
+    assert any(t["name"] == "postgres.execute_outbound_wire" for t in admin_search.json()["routed_tools"])
+
+    # Test tools/list pagination & domain_filter over /mcp/jsonrpc
+    page1 = client.post(
+        "/mcp/jsonrpc",
+        headers={"Authorization": f"Bearer {admin_jwt}"},
+        json={
+            "jsonrpc": "2.0",
+            "id": 91,
+            "method": "tools/list",
+            "params": {"domain_filter": "snowflake", "cursor": 0, "page_size": 5},
+        },
+    ).json()
+    assert len(page1["result"]["tools"]) == 5
+    assert page1["result"]["nextCursor"] == "5"
+    assert all(t["domain"] == "snowflake" for t in page1["result"]["tools"])
+
+
+def test_routing_feedback_misses_and_audit_chain_endpoints():
+    fb = client.post(
+        "/api/v1/router/feedback",
+        json={
+            "query": "Escalate AML transaction alert",
+            "routed_tools": ["snowflake.cortex_search_docs"],
+            "selected_tool": "crm_rest.escalate_aml_suspicious_activity",
+        },
+    )
+    assert fb.status_code == 200
+    assert fb.json()["hit"] is False
+    assert fb.json()["miss_queue_size"] >= 1
+
+    misses = client.get("/api/v1/router/misses")
+    assert misses.status_code == 200
+    assert any(
+        m["selected_tool"] == "crm_rest.escalate_aml_suspicious_activity"
+        for m in misses.json()["misses"]
+    )
+
+    audit = client.get("/api/v1/governance/audit-verify")
+    assert audit.status_code == 200
+    assert audit.json()["valid"] is True
+    assert audit.json()["checked_events"] >= 1
 

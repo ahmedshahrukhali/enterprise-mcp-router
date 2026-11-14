@@ -13,10 +13,19 @@ Spans 8 enterprise domains:
 """
 
 import hashlib
+import json
 import math
 import re
 from collections import Counter
 from typing import Any, Dict, Iterable, List, Tuple
+
+try:
+    import tiktoken  # type: ignore[import-not-found]
+    _TIKTOKEN_ENC: Any = tiktoken.get_encoding("cl100k_base")
+except Exception:
+    _TIKTOKEN_ENC = None
+
+_BPE_FALLBACK_RE = re.compile(r"[A-Za-z0-9_]{1,6}|[^\sA-Za-z0-9_]")
 
 
 DOMAIN_KEYWORDS: Dict[str, List[str]] = {
@@ -344,31 +353,58 @@ _DOMAIN_TOOL_TEMPLATES: Dict[str, List[Tuple[str, str, bool, str]]] = {
 }
 
 
+def count_schema_tokens(tool_name: str, description: str, input_schema: Dict[str, Any]) -> int:
+    """
+    Measures token count of the serialized MCP tool definition (`name`, `description`, `inputSchema`).
+    Uses tiktoken `cl100k_base` when installed, or deterministic cl100k-equivalent BPE/punctuation chunks.
+    """
+    serialized = json.dumps(
+        {
+            "name": tool_name,
+            "description": description,
+            "inputSchema": input_schema,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    if _TIKTOKEN_ENC is not None:
+        return len(_TIKTOKEN_ENC.encode(serialized))
+    return len(_BPE_FALLBACK_RE.findall(serialized))
+
+
 def _build_tool_input_schema(name: str, domain: str) -> Dict[str, Any]:
     """Builds realistic, domain-specific JSON Schema Draft-07 contracts per MCP tool."""
     env_prop = {
         "type": "string",
         "enum": ["prod", "staging", "dev"],
         "default": "prod",
+        "description": "Execution environment scope",
+    }
+    correlation_prop = {
+        "type": "string",
+        "description": "Optional W3C traceparent or audit correlation identifier",
     }
     if name == "postgres.execute_outbound_wire":
         return {
             "type": "object",
+            "additionalProperties": False,
             "properties": {
                 "from_account": {"type": "string", "minLength": 3, "description": "Source institutional account ID"},
                 "to_account": {"type": "string", "minLength": 3, "description": "Destination institutional account ID"},
                 "amount_usd": {"type": "number", "minimum": 0.01, "description": "Wire amount in USD"},
                 "environment": env_prop,
+                "correlation_id": correlation_prop,
             },
             "required": ["from_account", "to_account", "amount_usd"],
         }
     if name in ("snowflake.execute_readonly_sql", "snowflake.analyze_query_plan"):
         return {
             "type": "object",
+            "additionalProperties": False,
             "properties": {
                 "sql": {"type": "string", "minLength": 6, "description": "Read-only SELECT SQL query"},
-                "role": {"type": "string", "default": "ai_platform_reader"},
-                "schema_name": {"type": "string", "default": "PORTFOLIO_GOLD"},
+                "role": {"type": "string", "default": "ai_platform_reader", "description": "Snowflake RBAC role"},
+                "schema_name": {"type": "string", "default": "PORTFOLIO_GOLD", "description": "Allow-listed schema"},
                 "environment": env_prop,
             },
             "required": ["sql"],
@@ -377,10 +413,11 @@ def _build_tool_input_schema(name: str, domain: str) -> Dict[str, Any]:
         if name == "portfolio_vsm.reallocate_portfolio_capacity":
             return {
                 "type": "object",
+                "additionalProperties": False,
                 "properties": {
                     "portfolio_id": {"type": "string", "minLength": 3, "description": "Target portfolio ID (e.g. PF-101)"},
-                    "delta_fte": {"type": "number", "minimum": -20.0, "maximum": 20.0},
-                    "justification": {"type": "string", "minLength": 5},
+                    "delta_fte": {"type": "number", "minimum": -20.0, "maximum": 20.0, "description": "FTE shift delta"},
+                    "justification": {"type": "string", "minLength": 5, "description": "Executive change rationale"},
                     "environment": env_prop,
                 },
                 "required": ["portfolio_id", "delta_fte"],
@@ -388,6 +425,7 @@ def _build_tool_input_schema(name: str, domain: str) -> Dict[str, Any]:
         if name == "portfolio_vsm.escalate_blocked_work_ticket":
             return {
                 "type": "object",
+                "additionalProperties": False,
                 "properties": {
                     "ticket_id": {"type": "string", "minLength": 3, "description": "Engineering ticket ID (e.g. ENG-401)"},
                     "escalation_tier": {"type": "string", "enum": ["L2", "VP_ENG", "EXEC"], "default": "VP_ENG"},
@@ -397,6 +435,7 @@ def _build_tool_input_schema(name: str, domain: str) -> Dict[str, Any]:
             }
         return {
             "type": "object",
+            "additionalProperties": False,
             "properties": {
                 "portfolio_id": {"type": "string", "description": "Optional portfolio ID filter (e.g. PF-101)"},
                 "okr_id": {"type": "string", "description": "Optional OKR ID filter (e.g. OKR-201)"},
@@ -409,6 +448,7 @@ def _build_tool_input_schema(name: str, domain: str) -> Dict[str, Any]:
 
     return {
         "type": "object",
+        "additionalProperties": False,
         "properties": {
             "query_or_id": {
                 "type": "string",
@@ -423,6 +463,7 @@ def _build_tool_input_schema(name: str, domain: str) -> Dict[str, Any]:
                 "description": "Maximum records or chunks to return",
             },
             "environment": env_prop,
+            "correlation_id": correlation_prop,
         },
         "required": ["query_or_id"],
     }
@@ -431,7 +472,7 @@ def _build_tool_input_schema(name: str, domain: str) -> Dict[str, Any]:
 def get_enterprise_tool_catalog() -> List[Dict[str, Any]]:
     """
     Returns the complete 120-tool Enterprise MCP Catalog with 64-dim embeddings,
-    JSON Schema input contracts, RBAC roles, and token footprint estimates.
+    JSON Schema input contracts, RBAC roles, and real serialized schema token counts.
     """
     catalog: List[Dict[str, Any]] = []
     for domain in DOMAIN_ORDER:
@@ -439,8 +480,7 @@ def get_enterprise_tool_catalog() -> List[Dict[str, Any]]:
         for name, desc, is_mutating, role in templates:
             emb = compute_query_embedding(f"{name} {domain} {desc}")
             input_schema = _build_tool_input_schema(name, domain)
-            # Realistic token count for full MCP tool definition (name + description + JSON schema properties)
-            schema_tokens = 128 + len(desc.split()) * 2
+            schema_tokens = count_schema_tokens(name, desc, input_schema)
             catalog.append(
                 {
                     "name": name,

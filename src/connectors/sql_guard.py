@@ -5,7 +5,7 @@ Prevents SQL injection, stacked multi-statement execution, DDL/DML mutations,
 and SELECT ... INTO subclause bypasses without false positives on legitimate column/table names.
 """
 
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, Optional, Set
 import sqlglot
 from sqlglot import exp
 
@@ -28,6 +28,46 @@ class SafeSQLValidator:
         exp.Into,
         exp.Command,
     )
+
+    ALLOWED_SQL_FUNCTIONS: Set[str] = {
+        "ABS",
+        "AVG",
+        "CASE",
+        "CAST",
+        "CEIL",
+        "CEILING",
+        "CHAR_LENGTH",
+        "COALESCE",
+        "CONCAT",
+        "COUNT",
+        "COUNT_IF",
+        "CURRENT_DATE",
+        "CURRENT_TIMESTAMP",
+        "DATE_PART",
+        "DATE_TRUNC",
+        "EXTRACT",
+        "FLOOR",
+        "IF",
+        "IFNULL",
+        "IIF",
+        "LENGTH",
+        "LOWER",
+        "LTRIM",
+        "MAX",
+        "MIN",
+        "NOW",
+        "NULLIF",
+        "REPLACE",
+        "ROUND",
+        "RTRIM",
+        "STRFTIME",
+        "SUBSTR",
+        "SUBSTRING",
+        "SUM",
+        "TRIM",
+        "TRY_CAST",
+        "UPPER",
+    }
 
     @classmethod
     def validate_readonly_sql(
@@ -89,7 +129,7 @@ class SafeSQLValidator:
         if not statements:
             return {"valid": False, "reason": "empty_sql_query", "role": role, "schema": schema}
 
-        # 4. Check for mutating statements / keywords anywhere in the statements
+        # 4. Strict single-SELECT AST allow-list, locking clause check, and function allow-list
         for stmt in statements:
             if not isinstance(stmt, (exp.Select, exp.Union)):
                 return {
@@ -98,7 +138,6 @@ class SafeSQLValidator:
                     "role": role,
                     "schema": schema,
                 }
-            # Check for mutating subclauses (e.g., SELECT ... INTO new_table)
             for node in stmt.walk():
                 if isinstance(node, cls.MUTATING_NODE_TYPES):
                     return {
@@ -107,6 +146,33 @@ class SafeSQLValidator:
                         "role": role,
                         "schema": schema,
                     }
+                if isinstance(node, exp.Lock):
+                    return {
+                        "valid": False,
+                        "reason": "locking_clause_blocked",
+                        "role": role,
+                        "schema": schema,
+                    }
+                if isinstance(node, exp.Anonymous):
+                    func_name = (node.name or "").upper()
+                    if func_name not in cls.ALLOWED_SQL_FUNCTIONS:
+                        return {
+                            "valid": False,
+                            "reason": "disallowed_sql_function_blocked",
+                            "blocked_function": func_name,
+                            "role": role,
+                            "schema": schema,
+                        }
+                elif isinstance(node, exp.Func):
+                    func_name = (node.sql_name() or "").upper()
+                    if func_name not in cls.ALLOWED_SQL_FUNCTIONS:
+                        return {
+                            "valid": False,
+                            "reason": "disallowed_sql_function_blocked",
+                            "blocked_function": func_name,
+                            "role": role,
+                            "schema": schema,
+                        }
 
         # 5. Check for stacked multi-statements
         if len(statements) > 1:

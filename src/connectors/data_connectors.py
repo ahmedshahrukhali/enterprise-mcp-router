@@ -56,17 +56,10 @@ def _execute_readonly_sqlite(
 class SnowflakeCortexConnector:
     """
     Governed Snowflake retrieval connector for enterprise Agentic AI workflows.
-    Enforces read-only SQL allow-listing, blocks multi-statement SQL injection and
-    mutating DDL/DML keywords (outside string literals), validates Snowflake RBAC roles,
-    and executes hybrid Cortex Search + structured table retrieval for RAG pipelines.
+    Delegates SQL inspection exclusively to SafeSQLValidator (sqlglot AST allow-list),
+    enforces read-only RBAC roles and schema allow-lists, and executes hybrid Cortex Search.
+    In production, pair with a dedicated read-only Snowflake role and warehouse session.
     """
-
-    FORBIDDEN_SQL_PATTERN = re.compile(
-        r"\b(DROP|DELETE|UPDATE|INSERT|ALTER|TRUNCATE|GRANT|REVOKE|CREATE|MERGE|COPY|CALL|EXEC|EXECUTE|PUT|GET)\b",
-        re.IGNORECASE,
-    )
-    SQL_COMMENT_PATTERN = re.compile(r"(--[^\r\n]*|/\*[\s\S]*?\*/)", re.MULTILINE)
-    SQL_STRING_LITERAL_PATTERN = re.compile(r"'([^']|'')*'")
 
     def __init__(self, allowed_roles: List[str], allowed_schemas: List[str]):
         self.allowed_roles = set(allowed_roles)
@@ -350,6 +343,7 @@ class PostgresEnterpriseConnector:
             "status": "ok",
             "role": role,
             "engine": "sqlite3_relational",
+            "transaction_mode": "READ ONLY (sqlite3.set_authorizer + AST)",
             "row_count": len(rows),
             "rows": rows,
             "active_snapshots": list(self._snapshots.keys()),

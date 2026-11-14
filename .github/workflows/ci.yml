@@ -19,12 +19,19 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
-      - name: Install dependencies
+      - name: Install dependencies & security/lint tooling
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
-      - name: Run Pytest suite
-        run: pytest -v
+          pip install ruff mypy pip-audit pytest-cov
+      - name: Lint with Ruff
+        run: ruff check src tests
+      - name: Type-check with Mypy
+        run: mypy --ignore-missing-imports src
+      - name: Dependency vulnerability audit
+        run: pip-audit || true
+      - name: Run Pytest suite with coverage
+        run: pytest --cov=src -v
       - name: Run CLI Benchmark Simulation
         run: python run_demo.py
       - name: Build Docker image

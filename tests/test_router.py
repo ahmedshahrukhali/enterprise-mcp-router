@@ -126,6 +126,7 @@ def test_stateful_hitl_interrupt_lifecycle():
         "postgres.execute_outbound_wire",
         ["platform_admin"],
         hitl_ticket_id=ticket["ticket_id"],
+        arguments={"from_account": "ACC-9001", "to_account": "ACC-9003", "amount_usd": 50000},
     )
     assert allowed["allowed"] is True
 

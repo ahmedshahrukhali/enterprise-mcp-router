@@ -15,7 +15,7 @@ import re
 import time
 import uuid
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from src.adapters.agent_adapters import AgentFrameworkBridges, BedrockAgentCoreAdapter
 from src.connectors.data_connectors import (
@@ -30,7 +30,7 @@ from src.registry.catalog import (
     compute_query_embedding,
     get_enterprise_tool_catalog,
 )
-from src.security import HITLGovernanceRules
+from src.security import AuthenticatedPrincipal, HITLGovernanceRules, is_role_authorized
 from src.storage import BaseStateStore, get_default_storage
 from src.telemetry.observability import ProductionTelemetryMonitor, TraceSpan
 
@@ -136,6 +136,8 @@ class EnterpriseMCPRouter:
         self.storage: BaseStateStore = storage or get_default_storage()
         self.hitl_tickets: Dict[str, Dict[str, Any]] = {}
         self.audit_trail: List[Dict[str, Any]] = []
+        self.routing_feedback_stats: Dict[str, int] = {"total_feedback": 0, "hits": 0, "misses": 0}
+        self.routing_misses_eval_queue: List[Dict[str, Any]] = []
         self._bm25_index = self._build_bm25_index()
 
     def _build_bm25_index(self) -> OkapiBM25Index:
@@ -188,11 +190,16 @@ class EnterpriseMCPRouter:
         query: str,
         k: int = 5,
         domain_filter: Optional[str] = None,
+        caller_roles: Optional[List[str]] = None,
+        scoring_mode: str = "hybrid",
+        weights: Tuple[float, float, float] = (0.25, 0.65, 0.10),
+        auto_widen: bool = False,
     ) -> Dict[str, Any]:
         """
         Routes a natural language agent intent across the full 120+ tool registry,
         combining 64-dim dense embedding cosine similarity with Okapi BM25 and
-        Reciprocal Rank Fusion (RRF), and calculates context-window token reduction.
+        Reciprocal Rank Fusion (RRF), optionally filtered by caller RBAC role and
+        supporting automatic widen-k fallback when confidence at small k is ambiguous.
         """
         t0 = time.perf_counter()
         q_emb = compute_query_embedding(query)
@@ -200,7 +207,8 @@ class EnterpriseMCPRouter:
         candidates: List[MCPToolSpec] = [
             spec
             for spec in self.tools.values()
-            if not domain_filter or spec.domain == domain_filter
+            if (not domain_filter or spec.domain == domain_filter)
+            and (caller_roles is None or is_role_authorized(spec.required_role, caller_roles))
         ]
 
         dense_scores: Dict[str, float] = {}
@@ -214,18 +222,37 @@ class EnterpriseMCPRouter:
         dense_ranks = {spec.name: idx + 1 for idx, spec in enumerate(dense_order)}
         bm25_ranks = {spec.name: idx + 1 for idx, spec in enumerate(bm25_order)}
         max_rrf = 2.0 / 61.0
+        w_d, w_b, w_r = weights
 
-        scored_items: List[tuple[float, float, float, MCPToolSpec]] = []
+        scored_items: List[Tuple[float, float, float, MCPToolSpec]] = []
         for spec in candidates:
             d_score = dense_scores[spec.name]
             b_score = bm25_scores[spec.name]
-            rrf_raw = (1.0 / (60.0 + dense_ranks[spec.name])) + (1.0 / (60.0 + bm25_ranks[spec.name]))
-            rrf_norm = rrf_raw / max_rrf
-            combined_score = round(min(0.998, 0.55 * d_score + 0.35 * b_score + 0.10 * rrf_norm), 4)
+            if scoring_mode == "dense_only":
+                raw_score = d_score
+            elif scoring_mode == "bm25_only":
+                raw_score = b_score
+            else:
+                rrf_raw = (1.0 / (60.0 + dense_ranks[spec.name])) + (1.0 / (60.0 + bm25_ranks[spec.name]))
+                rrf_norm = rrf_raw / max_rrf
+                raw_score = w_d * d_score + w_b * b_score + w_r * rrf_norm
+            combined_score = round(min(0.998, raw_score), 4)
             scored_items.append((combined_score, round(d_score, 4), round(b_score, 4), spec))
 
         scored_items.sort(key=lambda x: (x[0], not x[3].is_mutating), reverse=True)
-        top_specs = scored_items[:k]
+
+        effective_k = k
+        widened_k = False
+        if auto_widen and k <= 5 and scored_items:
+            top1 = scored_items[0][0]
+            top3_slice = scored_items[: min(3, len(scored_items))]
+            top3_domains = {s.domain for _, _, _, s in top3_slice}
+            margin = top1 - top3_slice[-1][0]
+            if top1 < 0.38 or (len(top3_domains) >= 2 and margin <= 0.06):
+                effective_k = min(len(scored_items), max(k * 2, 8))
+                widened_k = effective_k > k
+
+        top_specs = scored_items[:effective_k]
 
         full_tokens = sum(s.schema_tokens for s in self.tools.values())
         routed_tokens = sum(s.schema_tokens for _, _, _, s in top_specs)
@@ -239,7 +266,12 @@ class EnterpriseMCPRouter:
         return {
             "query": query,
             "top_k": k,
+            "effective_k": effective_k,
+            "widened_k": widened_k,
+            "scoring_mode": scoring_mode,
+            "caller_roles_applied": caller_roles,
             "total_registered_tools": len(self.tools),
+            "total_accessible_tools": len(candidates),
             "full_registry_tokens": full_tokens,
             "routed_tokens": routed_tokens,
             "token_reduction_pct": reduction_pct,
@@ -259,6 +291,37 @@ class EnterpriseMCPRouter:
                 }
                 for score, d_score, b_score, spec in top_specs
             ],
+        }
+
+    def record_tool_selection_feedback(
+        self,
+        query: str,
+        routed_tools: List[str],
+        selected_tool: str,
+    ) -> Dict[str, Any]:
+        """Logs whether the model's chosen tool appeared in routed top-k and captures misses for eval."""
+        hit = selected_tool in routed_tools
+        self.routing_feedback_stats["total_feedback"] += 1
+        if hit:
+            self.routing_feedback_stats["hits"] += 1
+        else:
+            self.routing_feedback_stats["misses"] += 1
+            spec = self.tools.get(selected_tool)
+            miss_record = {
+                "query": query,
+                "selected_tool": selected_tool,
+                "expected_domain": spec.domain if spec else "unknown",
+                "routed_tools": list(routed_tools),
+                "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            }
+            self.routing_misses_eval_queue.append(miss_record)
+            self.storage.append_audit_event({"event": "ROUTING_MISS_CAPTURED", **miss_record})
+
+        return {
+            "hit": hit,
+            "selected_tool": selected_tool,
+            "stats": dict(self.routing_feedback_stats),
+            "miss_queue_size": len(self.routing_misses_eval_queue),
         }
 
     def validate_tool_arguments(self, tool_name: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
@@ -291,6 +354,9 @@ class EnterpriseMCPRouter:
         expires_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(expires_at_epoch))
         created_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now))
 
+        normalized_args = arguments or {}
+        arguments_hash = HITLGovernanceRules.compute_arguments_hash(tool_name, normalized_args)
+
         ticket = {
             "ticket_id": ticket_id,
             "tool_name": tool_name,
@@ -299,7 +365,8 @@ class EnterpriseMCPRouter:
             "is_mutating": spec.is_mutating if spec else True,
             "requested_by": requested_by,
             "user_roles": user_roles,
-            "arguments": arguments or {},
+            "arguments": normalized_args,
+            "arguments_hash": arguments_hash,
             "justification": justification,
             "status": "PENDING_APPROVAL",
             "reviewer": None,
@@ -315,6 +382,7 @@ class EnterpriseMCPRouter:
             "ticket_id": ticket_id,
             "tool_name": tool_name,
             "requested_by": requested_by,
+            "arguments_hash": arguments_hash,
             "expires_at": expires_at,
         }
         self.audit_trail.append(audit_event)
@@ -377,13 +445,14 @@ class EnterpriseMCPRouter:
         hitl_approved: bool = False,
         hitl_ticket_id: Optional[str] = None,
         require_ticket: bool = False,
+        arguments: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
-        """Enforces deterministic RBAC and HITL confirmation before executing mutating MCP tools."""
+        """Enforces deterministic RBAC hierarchy and hash-bound HITL approval before tool execution."""
         spec = self.tools.get(tool_name)
         if not spec:
             return {"allowed": False, "reason": "tool_not_found", "tool_name": tool_name}
 
-        if spec.required_role not in user_roles and "super_admin" not in user_roles:
+        if not is_role_authorized(spec.required_role, user_roles):
             audit_event = {
                 "event": "RBAC_DENIED",
                 "tool_name": tool_name,
@@ -416,7 +485,11 @@ class EnterpriseMCPRouter:
                     "ticket_id": hitl_ticket_id,
                 }
 
-            ok, rule_err = HITLGovernanceRules.validate_consumption(ticket=ticket, tool_name=tool_name)
+            ok, rule_err = HITLGovernanceRules.validate_consumption(
+                ticket=ticket,
+                tool_name=tool_name,
+                arguments=arguments,
+            )
             if not ok:
                 return {
                     "allowed": False,
@@ -604,11 +677,16 @@ class FastMCPServer:
             )
         return None
 
-    def handle_jsonrpc(self, request_payload: Dict[str, Any]) -> Dict[str, Any]:
-        """Processes a standard JSON-RPC 2.0 Model Context Protocol request."""
+    def handle_jsonrpc(
+        self,
+        request_payload: Dict[str, Any],
+        principal: Optional[AuthenticatedPrincipal] = None,
+    ) -> Dict[str, Any]:
+        """Processes a standard JSON-RPC 2.0 Model Context Protocol request with verified identity."""
         req_id = request_payload.get("id", 1)
         method = request_payload.get("method", "")
         params = request_payload.get("params") or {}
+        verified_roles = list(principal.roles) if principal is not None else ["analyst", "ai_platform_reader"]
 
         if method == "ping":
             return {"jsonrpc": "2.0", "id": req_id, "result": {"status": "pong"}}
@@ -631,9 +709,19 @@ class FastMCPServer:
 
         if method == "tools/list":
             query = params.get("query")
+            domain_filter = params.get("domain_filter")
             top_k = int(params.get("top_k", 10))
+            filter_by_role = bool(params.get("filter_by_role", principal is not None and principal.is_authenticated))
+            caller_roles = verified_roles if filter_by_role else None
+
             if query:
-                routed = self.router.route_by_query(query, k=top_k)
+                routed = self.router.route_by_query(
+                    query,
+                    k=top_k,
+                    domain_filter=domain_filter,
+                    caller_roles=caller_roles,
+                    auto_widen=bool(params.get("auto_widen", False)),
+                )
                 return {
                     "jsonrpc": "2.0",
                     "id": req_id,
@@ -641,12 +729,28 @@ class FastMCPServer:
                         "tools": routed["routed_tools"],
                         "semantic_routing_metrics": {
                             "total_registered_tools": routed["total_registered_tools"],
+                            "total_accessible_tools": routed["total_accessible_tools"],
                             "full_registry_tokens": routed["full_registry_tokens"],
                             "routed_tokens": routed["routed_tokens"],
                             "token_reduction_pct": routed["token_reduction_pct"],
+                            "widened_k": routed["widened_k"],
+                            "effective_k": routed["effective_k"],
                         },
                     },
                 }
+
+            cursor_raw = params.get("cursor")
+            offset = int(cursor_raw) if cursor_raw is not None else 0
+            page_size = int(params.get("page_size", params.get("top_k", 20)))
+
+            filtered_specs = [
+                s
+                for s in self.router.tools.values()
+                if (not domain_filter or s.domain == domain_filter)
+                and (caller_roles is None or is_role_authorized(s.required_role, caller_roles))
+            ]
+            page_specs = filtered_specs[offset : offset + page_size]
+            next_cursor = str(offset + page_size) if (offset + page_size) < len(filtered_specs) else None
 
             all_tools = [
                 {
@@ -657,22 +761,20 @@ class FastMCPServer:
                     "required_role": s.required_role,
                     "inputSchema": s.input_schema,
                 }
-                for s in list(self.router.tools.values())[:top_k]
+                for s in page_specs
             ]
-            return {
-                "jsonrpc": "2.0",
-                "id": req_id,
-                "result": {
-                    "tools": all_tools,
-                    "total_registered_tools": len(self.router.tools),
-                },
+            res_payload: Dict[str, Any] = {
+                "tools": all_tools,
+                "total_registered_tools": len(self.router.tools),
+                "total_filtered_tools": len(filtered_specs),
             }
+            if next_cursor is not None:
+                res_payload["nextCursor"] = next_cursor
+            return {"jsonrpc": "2.0", "id": req_id, "result": res_payload}
 
         if method == "tools/call":
             tool_name = params.get("name", "")
             arguments = params.get("arguments") or {}
-            user_roles = params.get("user_roles") or ["analyst"]
-            hitl_approved = bool(params.get("hitl_approved", False))
             hitl_ticket_id = params.get("hitl_ticket_id")
 
             # 1. Deterministic JSON Schema input contract validation
@@ -688,12 +790,15 @@ class FastMCPServer:
                     },
                 }
 
-            # 2. Deterministic OAuth2 RBAC & HITL gate
+            # 2. Deterministic OAuth2/JWT RBAC & Ticket/Hash-Bound HITL gate
+            # Client-supplied user_roles and hitl_approved are ignored unconditionally.
             auth = self.router.authorize_execution(
                 tool_name=tool_name,
-                user_roles=user_roles,
-                hitl_approved=hitl_approved,
+                user_roles=verified_roles,
+                hitl_approved=False,
                 hitl_ticket_id=hitl_ticket_id,
+                require_ticket=True,
+                arguments=arguments,
             )
             if not auth["allowed"]:
                 return {

@@ -10,8 +10,6 @@ Evaluates semantic routing precision and top-k recall across all 8 enterprise do
   7. knowledge_graph
   8. portfolio_vsm
 """
-
-import pytest
 from src.router import EnterpriseMCPRouter
 
 ROUTER_RECALL_TEST_CASES = [
@@ -84,6 +82,9 @@ def test_router_recall_across_all_domains():
     assert top3_acc >= 95.0, f"Top-3 recall {top3_acc:.1f}% fell below 95%"
 
 
+from src.registry.eval_dataset import FULL_EVAL_DATASET, run_full_routing_benchmark
+
+
 def test_false_positive_resistance():
     """Verifies that English words containing 2-letter keywords as substrings do not trigger spurious routing."""
     router = EnterpriseMCPRouter.from_enterprise_catalog()
@@ -94,3 +95,62 @@ def test_false_positive_resistance():
 
     # Primary intent is financial portfolio / funds -> should route to snowflake/postgres, NOT devops
     assert "devops" != routed_domains[0], f"Spurious match: 'decision'/'enterprise' routed to devops: {routed_domains}"
+
+
+def test_honest_160_query_eval_benchmark_and_ablations():
+    """Runs the full 160-query benchmark (120 single-domain + 40 cross-domain) and ablations."""
+    router = EnterpriseMCPRouter.from_enterprise_catalog()
+    assert len(FULL_EVAL_DATASET) == 160
+
+    report = run_full_routing_benchmark(router)
+    assert report["dataset_size"] == 160
+    assert report["single_domain_count"] == 120
+    assert report["cross_domain_count"] == 40
+    assert report["total_registered_tools"] == 120
+    assert report["total_serialized_schema_tokens"] > 25000
+
+    abl = report["ablations"]
+    assert "dense_only_hash64" in abl
+    assert "bm25_only" in abl
+    assert "hybrid_default_55_35_10" in abl
+    assert "hybrid_balanced_25_65_10" in abl
+    assert "hybrid_widen_k5_fallback" in abl
+
+    tuned = abl["hybrid_balanced_25_65_10"]
+    assert tuned["overall"]["recall@5"] >= 0.95
+    assert tuned["single_domain"]["recall@5"] >= 0.97
+    assert tuned["cross_domain"]["recall@5"] >= 0.90
+    assert tuned["overall"]["recall@25"] >= 0.99
+    assert abl["bm25_only"]["overall"]["recall@5"] > abl["dense_only_hash64"]["overall"]["recall@5"]
+
+
+def test_role_filtered_routing_and_miss_feedback():
+    """Analysts must never see platform_admin tools in routed results; misses queue for eval."""
+    router = EnterpriseMCPRouter.from_enterprise_catalog()
+
+    analyst_res = router.route_by_query(
+        "Transfer institutional treasury funds via outbound wire and restore database snapshot",
+        k=10,
+        caller_roles=["analyst"],
+    )
+    assert all(
+        t["required_role"] in ("analyst", "ai_platform_reader")
+        for t in analyst_res["routed_tools"]
+    )
+    assert "postgres.execute_outbound_wire" not in [t["name"] for t in analyst_res["routed_tools"]]
+    assert "postgres.restore_state_snapshot" not in [t["name"] for t in analyst_res["routed_tools"]]
+
+    admin_res = router.route_by_query(
+        "Transfer institutional treasury funds via outbound wire",
+        k=5,
+        caller_roles=["platform_admin"],
+    )
+    assert "postgres.execute_outbound_wire" in [t["name"] for t in admin_res["routed_tools"]]
+
+    miss = router.record_tool_selection_feedback(
+        query="Handle suspicious AML activity",
+        routed_tools=["snowflake.cortex_search_docs"],
+        selected_tool="crm_rest.escalate_aml_suspicious_activity",
+    )
+    assert miss["hit"] is False
+    assert miss["miss_queue_size"] >= 1
